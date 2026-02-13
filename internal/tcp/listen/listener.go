@@ -28,9 +28,22 @@ import (
 
 var (
 	NetStack *stack.Stack
+
+	// MaxConcurrentConns limits the number of simultaneous TCP connections from peers.
+	MaxConcurrentConns = 128
+	// ConnReadTimeout is the deadline for reading a complete length-prefixed message.
+	ConnReadTimeout = 60 * time.Second
+	// ConnIdleTimeout is how long a connection can sit idle before being closed.
+	ConnIdleTimeout = 5 * time.Minute
+
+	// connSem limits concurrent TCP connections. Initialized in SetupNetworkStack.
+	connSem chan struct{}
 )
 
 func SetupNetworkStack(yggCore *core.Core, tcpPort int, routerURL string, a2aURL string) {
+	// Initialize connection semaphore with configured limit
+	connSem = make(chan struct{}, MaxConcurrentConns)
+
 	// Create ipv6rwc wrapper
 	rwc := ipv6rwc.NewReadWriteCloser(yggCore)
 
@@ -159,7 +172,17 @@ func startTCPListener(tcpPort int, routerURL string, a2aURL string) {
 			log.Printf("Accept error: %v", err)
 			continue
 		}
-		go handleTCPConn(conn, routerURL, a2aURL)
+		select {
+		case connSem <- struct{}{}:
+			go func() {
+				defer func() { <-connSem }()
+				handleTCPConn(conn, routerURL, a2aURL)
+			}()
+		default:
+			log.Printf("Connection limit reached (%d), rejecting connection from %s",
+				MaxConcurrentConns, conn.RemoteAddr())
+			conn.Close()
+		}
 	}
 }
 
@@ -192,6 +215,9 @@ func handleTCPConn(conn net.Conn, routerURL string, a2aURL string) {
 		multiplexer.AddSource(a2aStream, func() any { return &api.A2AMessage{} })
 	}
 	for {
+		// Idle timeout: close if no new message arrives within the window
+		conn.SetReadDeadline(time.Now().Add(ConnIdleTimeout))
+
 		// Read Length
 		lenBuf := make([]byte, 4)
 		if _, err := io.ReadFull(conn, lenBuf); err != nil {
@@ -201,6 +227,14 @@ func handleTCPConn(conn net.Conn, routerURL string, a2aURL string) {
 			return
 		}
 		length := binary.BigEndian.Uint32(lenBuf)
+		if length > api.MaxMessageSize {
+			log.Printf("Message size %d from peer %s exceeds maximum %d, closing connection",
+				length, fromPeerId[:16], api.MaxMessageSize)
+			return
+		}
+
+		// Message read timeout: once we have the length, the full payload must arrive promptly
+		conn.SetReadDeadline(time.Now().Add(ConnReadTimeout))
 
 		// Read Data
 		dataBuf := make([]byte, length)
@@ -210,36 +244,37 @@ func handleTCPConn(conn net.Conn, routerURL string, a2aURL string) {
 		}
 
 		// Use stream multiplexing for server applications (MCP), like HTTP/2
+		handled := false
 		for _, stream := range multiplexer.sources {
 			msgPtr := multiplexer.requestTypes[stream.GetID()]()
 			if stream.IsAllowed(dataBuf, msgPtr) {
-				// This is request belongs to this stream
 				respBytes, err := stream.Forward(msgPtr, fromPeerId)
 				if err != nil {
 					log.Printf("Stream %s forward error: %v", stream.GetID(), err)
-					continue
-				}
-				if respBytes != nil {
+				} else if respBytes != nil {
 					if err := sendResponse(conn, respBytes); err != nil {
 						log.Printf("Stream %s failed to send response: %v", stream.GetID(), err)
 					}
 				}
-				continue
+				handled = true
+				break
 			}
 		}
 
-		// Not an stream message - queue it for client applications pulling from /recv
-		msg := api.ReceivedMessage{
-			FromPeerId: fromPeerId,
-			Data:       dataBuf,
-		}
+		// Only queue for /recv if no stream handled the message
+		if !handled {
+			msg := api.ReceivedMessage{
+				FromPeerId: fromPeerId,
+				Data:       dataBuf,
+			}
 
-		api.RecvMutex.Lock()
-		if len(api.RecvQueue) >= 100 {
-			api.RecvQueue = api.RecvQueue[1:]
+			api.RecvMutex.Lock()
+			if len(api.RecvQueue) >= 100 {
+				api.RecvQueue = api.RecvQueue[1:]
+			}
+			api.RecvQueue = append(api.RecvQueue, msg)
+			api.RecvMutex.Unlock()
 		}
-		api.RecvQueue = append(api.RecvQueue, msg)
-		api.RecvMutex.Unlock()
 	}
 }
 
