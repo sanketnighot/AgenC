@@ -1,0 +1,12 @@
+[project]
+name = "agent-api"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.136.1",
+    "pydantic>=2.13.3",
+    "requests>=2.33.1",
+    "uvicorn>=0.46.0",
+]
