@@ -3,5 +3,5 @@
   "Peers": ["tls://127.0.0.1:9001"],
   "Listen": [],
   "api_port": 8003,
-  "tcp_port": 7003
+  "tcp_port": 7001
 }
