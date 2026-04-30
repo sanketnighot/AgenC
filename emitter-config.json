@@ -1,0 +1,7 @@
+{
+  "PrivateKeyPath": "emitter.pem",
+  "Peers": [],
+  "Listen": ["tls://127.0.0.1:9001"],
+  "api_port": 8001,
+  "tcp_port": 7001
+}
