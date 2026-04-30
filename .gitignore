@@ -39,3 +39,6 @@ Thumbs.db
 
 # miscellaneous
 scratchpad.txt
+
+# envs
+*.env
