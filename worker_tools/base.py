@@ -20,6 +20,7 @@ class ToolContext:
     bounty_id: str | None
     stream_id: str | None = None
     worker_api_base: str = ""  # e.g. http://127.0.0.1:8002 — for MCP HTTP calls via local node
+    artifact_paths: list[str] = field(default_factory=list)  # e.g. PNG paths from image tools
 
 
 @dataclass

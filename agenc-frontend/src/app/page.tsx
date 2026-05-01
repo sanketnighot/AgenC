@@ -34,6 +34,11 @@ interface BidEntry {
   outcome: "bid" | "awarded" | "rejected";
 }
 
+interface BountyImage {
+  mime: string;
+  data_base64: string;
+}
+
 interface BountyCard {
   bounty_id: string;
   task: string;
@@ -42,6 +47,7 @@ interface BountyCard {
   winner_specialty?: string;
   worker_id?: string;
   result?: string;
+  images?: BountyImage[];
   collaborating_workers?: string[];
   collaboration?: boolean;
   bids: BidEntry[];
@@ -232,14 +238,29 @@ function AuctionBountyCard({
             </div>
           )}
 
-          {b.result && (
+          {(b.result || (b.images && b.images.length > 0)) && (
             <div className="bg-zinc-950/60 rounded-xl border border-zinc-800/40 p-2.5 space-y-1.5">
               {b.collaboration && (
                 <span className="inline-flex items-center gap-1 rounded-full border border-violet-500/20 bg-violet-500/8 px-2 py-0.5 text-[9px] font-medium text-violet-400/80">
                   ⬡ collaborative result
                 </span>
               )}
-              <p className="text-xs leading-relaxed text-zinc-400">{b.result}</p>
+              {b.images && b.images.length > 0 && (
+                <div className="flex flex-col gap-2">
+                  {b.images.map((img, idx) => (
+                    // eslint-disable-next-line @next/next/no-img-element -- data URLs from worker
+                    <img
+                      key={idx}
+                      src={`data:${img.mime};base64,${img.data_base64}`}
+                      alt=""
+                      className="max-h-72 w-full rounded-lg border border-zinc-700/50 object-contain bg-zinc-900/40"
+                    />
+                  ))}
+                </div>
+              )}
+              {b.result && (
+                <p className="text-xs leading-relaxed text-zinc-400 whitespace-pre-wrap">{b.result}</p>
+              )}
             </div>
           )}
 
@@ -618,11 +639,32 @@ export default function Home() {
     });
 
     es.addEventListener("bounty_completed", (e) => {
-      const { bounty_id, result, specialty, collaboration, node_key: completingNodeKey } = JSON.parse(e.data);
+      const {
+        bounty_id,
+        result,
+        specialty,
+        collaboration,
+        node_key: completingNodeKey,
+        images,
+      } = JSON.parse(e.data) as {
+        bounty_id: string;
+        result: string;
+        specialty: string;
+        collaboration?: boolean;
+        node_key?: string;
+        images?: BountyImage[];
+      };
       setBounties((prev) =>
         prev.map((b) =>
           b.bounty_id === bounty_id
-            ? { ...b, status: "COMPLETED", result, winner_specialty: specialty, collaboration }
+            ? {
+                ...b,
+                status: "COMPLETED",
+                result,
+                images: images && images.length ? images : undefined,
+                winner_specialty: specialty,
+                collaboration,
+              }
             : b,
         ),
       );

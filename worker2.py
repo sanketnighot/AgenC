@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -28,6 +30,59 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TaskOutput:
+    """Final worker text plus optional inline images for the bridge UI."""
+
+    text: str
+    images: list[dict[str, str]] = field(default_factory=list)
+
+
+def _images_from_artifact_paths(
+    paths: list[str],
+    *,
+    max_images: int = 4,
+    max_total_bytes: int = 4_500_000,
+) -> list[dict[str, str]]:
+    """Embed PNG/JPEG from disk for COMPLETED_BOUNTY (same host as worker)."""
+    out: list[dict[str, str]] = []
+    total = 0
+    seen: set[str] = set()
+    for p in paths:
+        if len(out) >= max_images:
+            break
+        if p in seen:
+            continue
+        seen.add(p)
+        path = Path(p)
+        if not path.is_file():
+            continue
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            continue
+        if total + len(raw) > max_total_bytes:
+            logger.warning(
+                "Skipping image %s: would exceed bounty image budget (%s bytes)",
+                path.name,
+                max_total_bytes,
+            )
+            break
+        total += len(raw)
+        suffix = path.suffix.lower()
+        mime = "image/png"
+        if suffix in (".jpg", ".jpeg"):
+            mime = "image/jpeg"
+        elif suffix == ".webp":
+            mime = "image/webp"
+        elif suffix == ".gif":
+            mime = "image/gif"
+        out.append(
+            {"mime": mime, "data_base64": base64.b64encode(raw).decode("ascii")}
+        )
+    return out
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -203,7 +258,7 @@ def evaluate_claim(task: str, bounty_id: str | None = None) -> dict:
 
 def process_task_with_prompt(
     task: str, system_prompt: str, bounty_id: str | None = None
-) -> str:
+) -> TaskOutput:
     sid = new_stream_id()
     if MOCK_MODE:
         emit_mock_stream_chunks(
@@ -213,7 +268,7 @@ def process_task_with_prompt(
             bounty_id=bounty_id,
             stream_id=sid,
         )
-        return MOCK_RESULT
+        return TaskOutput(text=MOCK_RESULT, images=[])
     ctx = ToolContext(
         node_key=OWN_NODE_KEY,
         bounty_id=bounty_id,
@@ -233,11 +288,12 @@ def process_task_with_prompt(
         timeout=120.0,
     )
     if not text.strip():
-        return "AI Execution Error: empty response"
-    return text
+        return TaskOutput(text="AI Execution Error: empty response", images=[])
+    imgs = _images_from_artifact_paths(ctx.artifact_paths)
+    return TaskOutput(text=text, images=imgs)
 
 
-def process_task(task: str, bounty_id: str | None = None) -> str:
+def process_task(task: str, bounty_id: str | None = None) -> TaskOutput:
     return process_task_with_prompt(task, SYSTEM_PROMPT, bounty_id=bounty_id)
 
 
@@ -375,7 +431,7 @@ async def handle_collaboration(payload: dict, fallback_emitter_peer_id: str) -> 
     )
 
     try:
-        my_result = await asyncio.wait_for(
+        my_out = await asyncio.wait_for(
             loop.run_in_executor(
                 None,
                 lambda: process_task_with_prompt(task, collab_prompt, bounty_id),
@@ -383,8 +439,8 @@ async def handle_collaboration(payload: dict, fallback_emitter_peer_id: str) -> 
             timeout=90.0,
         )
     except asyncio.TimeoutError:
-        my_result = f"{SPECIALTY} task execution timed out."
-    logger.info("[collab] My result: %s…", my_result[:60])
+        my_out = TaskOutput(text=f"{SPECIALTY} task execution timed out.", images=[])
+    logger.info("[collab] My result: %s…", my_out.text[:60])
 
     if is_lead:
         share_queue = router.register_collab_shares(bounty_id)
@@ -410,7 +466,7 @@ async def handle_collaboration(payload: dict, fallback_emitter_peer_id: str) -> 
                         None,
                         lambda: merge_results(
                             task,
-                            my_result,
+                            my_out.text,
                             SPECIALTY,
                             peer_results,
                             peer_specialties_received,
@@ -420,19 +476,22 @@ async def handle_collaboration(payload: dict, fallback_emitter_peer_id: str) -> 
                     timeout=90.0,
                 )
             except asyncio.TimeoutError:
-                final = "\n\n".join([my_result] + peer_results)
+                final = "\n\n".join([my_out.text] + peer_results)
         else:
-            final = my_result
+            final = my_out.text
 
         all_specialties = [SPECIALTY] + peer_specialties_received
-        ok = await loop.run_in_executor(None, axl_send, emitter_peer_id, {
+        payload_done = {
             "type": "COMPLETED_BOUNTY",
             "bounty_id": bounty_id,
             "result": final,
             "specialty": " + ".join(all_specialties),
             "collaboration": True,
             "collaborators": all_specialties,
-        })
+        }
+        if my_out.images:
+            payload_done["images"] = my_out.images
+        ok = await loop.run_in_executor(None, axl_send, emitter_peer_id, payload_done)
         if not ok:
             logger.warning("[send_fail] COMPLETED_BOUNTY for #%s", bounty_id)
         else:
@@ -449,7 +508,7 @@ async def handle_collaboration(payload: dict, fallback_emitter_peer_id: str) -> 
         ok = await loop.run_in_executor(None, axl_send, target_peer_id, {
             "type": "COLLAB_SHARE",
             "bounty_id": bounty_id,
-            "result": my_result,
+            "result": my_out.text,
             "specialty": SPECIALTY,
         })
         if not ok:
@@ -519,22 +578,25 @@ async def handle_new_bounty(from_peer: str, payload: dict) -> None:
         if decision == "AWARD":
             logger.info("[award]  #%s awarded! Executing…", bounty_id)
             try:
-                result = await asyncio.wait_for(
+                out = await asyncio.wait_for(
                     loop.run_in_executor(None, process_task, task, bounty_id),
                     timeout=90.0,
                 )
             except asyncio.TimeoutError:
-                result = "Task execution timed out."
-            ok = await loop.run_in_executor(None, axl_send, from_peer, {
+                out = TaskOutput(text="Task execution timed out.", images=[])
+            payload_cb = {
                 "type": "COMPLETED_BOUNTY",
                 "bounty_id": bounty_id,
                 "task": task,
-                "result": result,
+                "result": out.text,
                 "specialty": SPECIALTY,
-            })
+            }
+            if out.images:
+                payload_cb["images"] = out.images
+            ok = await loop.run_in_executor(None, axl_send, from_peer, payload_cb)
             if not ok:
                 logger.warning("[send_fail] COMPLETED_BOUNTY for #%s", bounty_id)
-            logger.info("[done]   #%s: %s…", bounty_id, result[:80])
+            logger.info("[done]   #%s: %s…", bounty_id, out.text[:80])
 
         elif decision == "COLLAB_AWARD":
             await handle_collaboration(collab_payload, from_peer)

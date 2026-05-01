@@ -613,6 +613,7 @@ async def handle_inbound(from_peer: str, payload: dict) -> None:
             return
 
         result_text = payload.get("result", "")
+        images_payload = payload.get("images")
         collaboration = payload.get("collaboration", False)
         collaborators_payload = payload.get("collaborators", [])
         completing_node_key = resolve_node_key(from_peer)
@@ -623,6 +624,8 @@ async def handle_inbound(from_peer: str, payload: dict) -> None:
                 return
             b["status"] = "COMPLETED"
             b["result"] = result_text
+            if isinstance(images_payload, list) and images_payload:
+                b["images"] = images_payload
             specialty = payload.get("specialty") or b.get("winner_specialty", "Unknown")
             stored_collaborators = list(b.get("collaborators") or [])
 
@@ -639,17 +642,20 @@ async def handle_inbound(from_peer: str, payload: dict) -> None:
         node_states["emitter"]["status"] = "idle"
         await broadcast("node_status", {"node_id": "emitter", "status": "idle"})
 
+        evt = {
+            "bounty_id": bounty_id,
+            "result": result_text,
+            "specialty": specialty,
+            "worker_id": from_peer[:8],
+            "node_key": completing_node_key,
+            "collaboration": collaboration,
+            "collaborators": collaborators_payload,
+        }
+        if isinstance(images_payload, list) and images_payload:
+            evt["images"] = images_payload
         await broadcast(
             "bounty_completed",
-            {
-                "bounty_id": bounty_id,
-                "result": result_text,
-                "specialty": specialty,
-                "worker_id": from_peer[:8],
-                "node_key": completing_node_key,
-                "collaboration": collaboration,
-                "collaborators": collaborators_payload,
-            },
+            evt,
         )
 
 

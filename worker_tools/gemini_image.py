@@ -97,11 +97,13 @@ def handle_gemini_generate_image(args: dict[str, Any], ctx: ToolContext) -> Tool
     fname = f"{uuid.uuid4().hex[:12]}.png"
     path = out_dir / fname
     path.write_bytes(raw)
+    path_str = str(path)
+    ctx.artifact_paths.append(path_str)
 
     return ToolResult(
         True,
         data={
-            "path": str(path),
+            "path": path_str,
             "mime": mime,
             "caption_hint": caption.strip()[:500],
             "prompt_excerpt": prompt[:200],
