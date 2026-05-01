@@ -1,7 +1,8 @@
 "use client";
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 
-import { MeshHub, type MeshWorkerView } from "@/components/MeshHub";
+import { MeshFlowMap } from "@/components/MeshFlowMap";
+import type { MeshWorkerView } from "@/types/mesh";
 import {
   resolveWorkerNodeBySpecialty,
   routePath,
@@ -165,6 +166,17 @@ export default function Home() {
       const { node_id, status } = JSON.parse(e.data);
       setNodeStatus(node_id, status as NodeStatus);
     });
+    es.addEventListener("bounty_resolving", (e) => {
+      const { bounty_id } = JSON.parse(e.data);
+      addLog("resolve", `Claim window closed — resolving #${bounty_id}`);
+    });
+    es.addEventListener("arbiter_result", (e) => {
+      const { bounty_id, winner_node_key, reason, source } = JSON.parse(e.data);
+      addLog(
+        "arb",
+        `#${bounty_id} → ${winner_node_key} (${source}) ${(reason || "").slice(0, 100)}`,
+      );
+    });
     es.addEventListener("bounty_posted", (e) => {
       const { bounty_id, task: t, reward: rw } = JSON.parse(e.data);
       setBounties((prev) => [
@@ -276,6 +288,8 @@ export default function Home() {
     rej: "text-red-400/70",
     done: "text-emerald-300",
     exp: "text-zinc-600",
+    resolve: "text-zinc-500",
+    arb: "text-cyan-500/90",
   };
 
   return (
@@ -335,10 +349,10 @@ export default function Home() {
 
           {/* Mesh */}
           <section className="min-w-0 lg:min-h-[480px]">
-            <MeshHub
+            <MeshFlowMap
               emitter={nodes.emitter}
               workers={connectedWorkers}
-              nodes={nodes}
+              agentStates={nodes}
               meshPackets={meshPackets}
             />
           </section>

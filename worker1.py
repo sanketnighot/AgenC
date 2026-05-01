@@ -11,6 +11,9 @@ load_dotenv()
 WORKER_API = "http://127.0.0.1:8002"
 MOCK_MODE = False
 
+DECISION_TIMEOUT_SEC = int(os.environ.get("WORKER_DECISION_TIMEOUT_SEC", "60"))
+
+
 # ── LLM provider config ───────────────────────────────────────────────────────
 PROVIDERS = {
     "openai": {
@@ -51,22 +54,46 @@ SYSTEM_PROMPT = (
 
 
 # ── LLM self-selection ────────────────────────────────────────────────────────
-def should_claim(task: str) -> bool:
+def evaluate_claim(task: str) -> tuple[bool, float, str]:
+    """LLM: whether to bid, 0–1 fit score, short rationale for bridge arbiter."""
     if MOCK_MODE:
-        return True
+        return True, 0.85, "MOCK: specialty-aligned bid."
     try:
         resp = client.chat.completions.create(
             model=MODEL,
-            messages=[{"role": "user", "content":
-                f"You are a {SPECIALTY} agent. Does this task match your specialty? "
-                f"Task: '{task}'. Reply with only YES or NO."}],
-            max_tokens=5,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        f"You are a {SPECIALTY} agent. Reply with JSON only, no markdown: "
+                        '{"should_claim":true|false,"fit_score":0.0,"claim_rationale":"one short sentence"}'
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"Task to evaluate:\n{task[:6000]}",
+                },
+            ],
+            max_tokens=120,
+            temperature=0.2,
         )
-        answer = resp.choices[0].message.content.strip().upper()
-        return answer.startswith("Y")
+        raw = (resp.choices[0].message.content or "").strip()
+        start = raw.find("{")
+        end = raw.rfind("}") + 1
+        if start >= 0 and end > start:
+            raw = raw[start:end]
+        data = json.loads(raw)
+        should = bool(data.get("should_claim"))
+        try:
+            fs = float(data.get("fit_score", 0.0))
+        except (TypeError, ValueError):
+            fs = 0.0
+        fs = max(0.0, min(1.0, fs))
+        rationale = str(data.get("claim_rationale") or "").strip()[:300]
+        return should, fs, rationale
     except Exception as e:
-        print(f"[self-select error] {e}")
-        return False
+        print(f"[evaluate_claim error] {e}")
+        return False, 0.0, ""
 
 
 def process_task(task: str) -> str:
@@ -144,18 +171,20 @@ while True:
             print(f"\n[bounty] #{bounty_id} received: {task[:60]}")
 
             print(f"[think]  Evaluating task against {SPECIALTY} specialty...")
-            if not should_claim(task):
+            ok, fit_score, rationale = evaluate_claim(task)
+            if not ok:
                 print(f"[pass]   Task outside {SPECIALTY} specialty — standing down.")
             else:
-                print(f"[bid]    Claiming bounty #{bounty_id}...")
+                print(f"[bid]    Claiming bounty #{bounty_id} (fit={fit_score:.2f})...")
                 axl_send(sender_id, {
                     "type": "CLAIM",
                     "bounty_id": bounty_id,
                     "specialty": SPECIALTY,
-                    "confidence": "high",
+                    "fit_score": fit_score,
+                    "claim_rationale": rationale,
                 })
 
-                decision = wait_for_decision(bounty_id)
+                decision = wait_for_decision(bounty_id, timeout=DECISION_TIMEOUT_SEC)
 
                 if decision == "AWARD":
                     print(f"[award]  Bounty #{bounty_id} awarded! Executing task...")

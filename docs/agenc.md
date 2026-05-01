@@ -27,7 +27,7 @@ AgenC is built as a **zero-infrastructure** stack: developers join the mesh by r
 ### 2. GStack bridge
 
 - **Frontend:** Next.js app in **`agenc-frontend/`** — dashboard for posting bounties and viewing mesh-related activity (polls backend APIs).
-- **Backend:** **FastAPI** (or compatible) **bridge** — translates UI actions into AXL **`/send`**, **`/recv`**, **`/topology`** (and related flows). The bridge owns session logic, OpenAI calls for workers, and mapping mesh events into HTTP responses for the UI.
+- **Backend:** **FastAPI** (or compatible) **bridge** — translates UI actions into AXL **`/send`**, **`/recv`**, **`/topology`** (and related flows). The bridge owns session logic, **optional LLM-based arbitration** to pick the best claimant among workers, and mapping mesh events into HTTP/SSE for the UI.
 
 Together this follows the **[GStack](https://github.com/garrytan/gstack)** pattern: Next.js + Python API wired for fast iteration.
 
@@ -56,14 +56,40 @@ Emitted to the mesh (e.g. broadcast strategy defined by your bridge: multi-send,
 
 ### B. Task claim (Worker → Emitter)
 
+After `NEW_BOUNTY`, workers MAY bid with a **CLAIM** message. The bridge collects bids for a short **claim window** (starts on the first CLAIM), then runs an **arbiter** (LLM with deterministic fallbacks) to choose one worker and sends **`AWARD`** / **`REJECTED`** accordingly.
+
 ```json
 {
   "type": "CLAIM",
-  "status": "accepting_task"
+  "bounty_id": "a1b2c3d4",
+  "specialty": "Data Analyst",
+  "fit_score": 0.82,
+  "claim_rationale": "Task requires statistical comparison; strong match.",
+  "confidence": "high"
 }
 ```
 
-### C. Completed bounty (Worker → Emitter)
+| Field | Meaning |
+|-------|---------|
+| `bounty_id` | Correlates to the broadcast bounty (required). |
+| `specialty` | Worker persona label (required). |
+| `fit_score` | Self-assessed fit in **0.0–1.0** (recommended). |
+| `claim_rationale` | Short sentence for the bridge arbiter (optional; truncated server-side). |
+| `confidence` | Legacy hint (`high` / `medium` / `low`); used only if `fit_score` is absent. |
+
+### C. Award / rejection (Emitter → Worker)
+
+The bridge sends exactly one **`AWARD`** to the chosen worker and **`REJECTED`** to others (same `bounty_id`).
+
+```json
+{
+  "type": "AWARD",
+  "bounty_id": "a1b2c3d4",
+  "task": "…"
+}
+```
+
+### D. Completed bounty (Worker → Emitter)
 
 ```json
 {
@@ -95,7 +121,7 @@ Implementations MAY add fields (e.g. correlation ids, emitter public key echoes)
 | **Phase 1** — P2P mesh (e.g. 3 local AXL nodes) | Complete |
 | **Phase 2** — OpenAI on workers; real results over the mesh | Complete |
 | **Phase 3** — GStack UI; post bounties from web dashboard | Complete |
-| **Phase 4** — Competitive bidding; visual node status for demo | Next |
+| **Phase 4** — Competitive claims + bridge arbiter + visual node status | In progress |
 
 ---
 

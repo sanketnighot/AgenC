@@ -1,3 +1,10 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["main", "arbiter", "config"]
+
 [project]
 name = "agent-api"
 version = "0.1.0"
@@ -6,7 +13,13 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "fastapi>=0.136.1",
+    "openai>=1.40.0",
     "pydantic>=2.13.3",
     "requests>=2.33.1",
     "uvicorn>=0.46.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
 ]

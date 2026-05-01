@@ -1,56 +1,58 @@
 ---
 name: AgenC Bounty Protocol
-description: JSON message schema for NEW_BOUNTY, CLAIM, COMPLETED_BOUNTY and the full flow
+description: JSON message schema for NEW_BOUNTY, CLAIM, AWARD, COMPLETED_BOUNTY and arbitration flow
 type: project
 ---
 
 ## Message Types
 
 ### NEW_BOUNTY (Emitter → Workers)
+
 ```json
 {
   "type": "NEW_BOUNTY",
+  "bounty_id": "a1b2c3d4",
   "task": "Analyze the last 5 years of ETH price vs global inflation",
   "reward": "50 USDC"
 }
 ```
 
 ### CLAIM (Worker → Emitter)
+
+Collect window opens on **first** CLAIM per bounty; after `CLAIM_WINDOW_SEC`, bridge resolves via LLM arbiter + fallbacks.
+
 ```json
 {
   "type": "CLAIM",
-  "status": "accepting_task"
+  "bounty_id": "a1b2c3d4",
+  "specialty": "Creative Strategist",
+  "fit_score": 0.91,
+  "claim_rationale": "Marketing narrative aligns with creative positioning.",
+  "confidence": "high"
 }
 ```
 
+### AWARD / REJECTED (Emitter → Worker)
+
+Chosen worker receives `AWARD`; others receive `REJECTED` with same `bounty_id`.
+
 ### COMPLETED_BOUNTY (Worker → Emitter)
+
 ```json
 {
   "type": "COMPLETED_BOUNTY",
+  "bounty_id": "a1b2c3d4",
   "task": "Analyze...",
   "result": "The correlation is 0.72 based on historical data..."
 }
 ```
 
-## Current Flow
+## Bridge arbitration
 
-1. User submits task in Next.js UI → POST `/api/bounty` → FastAPI bridge
-2. Bridge sends `NEW_BOUNTY` via `/send` to both worker public keys
-3. Workers poll `/recv` every 2s; on `NEW_BOUNTY` → call OpenAI gpt-4o-mini
-4. Worker sends `COMPLETED_BOUNTY` back to emitter peer ID (from `X-From-Peer-Id` header)
-5. Frontend polls `/api/network-logs` every 2s → bridge polls emitter's `/recv` → shows in Mesh Network Logs
+- Separate credentials: `BRIDGE_*` env (see `agenc-api/.env.example`).
+- Fallback if LLM fails: highest `fit_score`, then earliest claim.
 
-## Current Limitation
+## Extension Points
 
-Workers currently receive the **full task** — no chunking/decomposition yet. Phase 4 goal is competitive bidding where workers race to claim specific sub-tasks.
-
-## Correlation
-
-No correlation ID in current protocol. Workers use `X-From-Peer-Id` header to know where to reply. The bridge hardcodes worker public keys.
-
-## Extension Points (Phase 4)
-
-- Add `bounty_id` field for correlation across multi-chunk tasks
-- Add `chunk_index` and `total_chunks` for task decomposition
-- Add `bid_amount` or `estimated_time` for competitive bidding
-- Add `status` field on CLAIM: `accepted` vs `rejected` (if already claimed)
+- Tune `CLAIM_WINDOW_SEC`, `BOUNTY_PENDING_MAX_SEC`, `NO_CLAIM_AFTER_BROADCAST_SEC`.
+- `ARBITER_SKIP_WHEN_UNANIMOUS=true` skips bridge LLM when only one worker claimed.
