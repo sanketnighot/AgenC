@@ -45,13 +45,22 @@ node_states: dict = {
     "worker_2": {"status": "idle", "label": "Worker 2", "specialty": "Creative Strategist"},
 }
 
-# peer_id (8-char prefix) → node key, for fast lookup when messages arrive
+# Normalise all stored peer IDs to lowercase so header comparisons never fail
+for _w in WORKER_NODES.values():
+    _w["peer_id"] = _w["peer_id"].strip().lower()
+
 PEER_ID_TO_NODE = {
     v["peer_id"][:8]: k for k, v in WORKER_NODES.items()
 }
 PEER_ID_FULL_TO_NODE = {
     v["peer_id"]: k for k, v in WORKER_NODES.items()
 }
+
+
+def resolve_node_key(peer_id: str) -> str:
+    """Resolve a peer ID (full 64-char or 8-char prefix) to a WORKER_NODES key."""
+    p = peer_id.strip().lower()
+    return PEER_ID_FULL_TO_NODE.get(p) or PEER_ID_TO_NODE.get(p[:8], "")
 
 # ── SSE broadcaster ───────────────────────────────────────────────────────────
 sse_clients: list[asyncio.Queue] = []
@@ -82,7 +91,7 @@ def _axl_recv() -> tuple[str | None, dict | None]:
     try:
         res = requests.get(f"{EMITTER_API}/recv", timeout=5)
         if res.status_code == 200 and res.text.strip():
-            from_peer = res.headers.get("X-From-Peer-Id", "")
+            from_peer = res.headers.get("X-From-Peer-Id", "").strip().lower()
             return from_peer, res.json()
     except Exception:
         pass
@@ -124,7 +133,7 @@ async def handle_inbound(from_peer: str, payload: dict) -> None:
             return
 
         b = bounties[bounty_id]
-        node_key = PEER_ID_FULL_TO_NODE.get(from_peer, "")
+        node_key = resolve_node_key(from_peer)
         specialty = payload.get("specialty", "Unknown")
         short_id = from_peer[:8]
 
@@ -155,15 +164,14 @@ async def handle_inbound(from_peer: str, payload: dict) -> None:
                 "node_key": node_key,
             })
 
-            # Reject all other workers
+            # Reject all other workers — compare by node key, not raw peer ID
             for wk, wv in WORKER_NODES.items():
-                if wv["peer_id"] != from_peer:
+                if wk != node_key:
                     reject_payload = {"type": "REJECTED", "bounty_id": bounty_id}
                     await loop.run_in_executor(None, _axl_send, wv["peer_id"], reject_payload)
-                    other_short = wv["peer_id"][:8]
                     await broadcast("worker_rejected", {
                         "bounty_id": bounty_id,
-                        "worker_id": other_short,
+                        "worker_id": wv["peer_id"][:8],
                         "specialty": wv["specialty"],
                         "node_key": wk,
                     })
@@ -191,7 +199,7 @@ async def handle_inbound(from_peer: str, payload: dict) -> None:
         specialty = payload.get("specialty", b.get("winner_specialty", "Unknown"))
         short_id = from_peer[:8]
 
-        node_key = PEER_ID_FULL_TO_NODE.get(from_peer, "")
+        node_key = resolve_node_key(from_peer)
         if node_key:
             node_states[node_key]["status"] = "idle"
             await broadcast("node_status", {"node_id": node_key, "status": "idle"})
