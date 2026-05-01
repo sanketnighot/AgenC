@@ -1,12 +1,41 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 
 export interface InsightPayload {
-  text: string;
+  toolText: string;
+  modelText: string;
   phase: string;
   bountyId?: string;
   specialty?: string;
+}
+
+function phasePretty(phase: string): string {
+  switch (phase) {
+    case "evaluate_claim":
+      return "Evaluating claim";
+    case "execute":
+      return "Executing bounty";
+    case "merge":
+      return "Merging perspectives";
+    case "tool":
+      return "Tools";
+    case "idle":
+      return "idle";
+    default:
+      return phase;
+  }
+}
+
+function StreamCursor({ reducedMotion }: { reducedMotion: boolean }) {
+  if (reducedMotion) {
+    return <span className="inline-block w-2 text-emerald-400">▍</span>;
+  }
+  return (
+    <span className="motion-safe:inline-block motion-safe:h-3 motion-safe:w-0.5 motion-safe:animate-pulse motion-safe:bg-emerald-400/90 motion-reduce:inline-block motion-reduce:w-2 motion-reduce:text-emerald-400">
+      ▍
+    </span>
+  );
 }
 
 /** Orbital telemetry capsule — anchored above worker node (screen coords). */
@@ -16,6 +45,8 @@ export function WorkerInsightBubble({
   workerLabel,
   agentStatus,
   insight,
+  telemetryEnabled,
+  sseConnected,
   onClose,
 }: {
   open: boolean;
@@ -23,9 +54,25 @@ export function WorkerInsightBubble({
   workerLabel: string;
   agentStatus: string;
   insight: InsightPayload | null;
+  /** null = still loading status from bridge */
+  telemetryEnabled: boolean | null;
+  sseConnected: boolean;
   onClose: () => void;
 }) {
-  const endRef = useRef<HTMLDivElement>(null);
+  const modelEndRef = useRef<HTMLDivElement>(null);
+  const toolEndRef = useRef<HTMLDivElement>(null);
+  const [reducedMotion, setReducedMotion] = useState(() =>
+    typeof window !== "undefined"
+      ? window.matchMedia("(prefers-reduced-motion: reduce)").matches
+      : false,
+  );
+
+  useEffect(() => {
+    const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const fn = () => setReducedMotion(mq.matches);
+    mq.addEventListener("change", fn);
+    return () => mq.removeEventListener("change", fn);
+  }, []);
 
   useEffect(() => {
     if (!open) return;
@@ -37,20 +84,41 @@ export function WorkerInsightBubble({
   }, [open, onClose]);
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [insight?.text]);
+    modelEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [insight?.modelText]);
+
+  useEffect(() => {
+    toolEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [insight?.toolText]);
 
   if (!open || !anchor) return null;
 
   const phaseLabel = insight?.phase ?? "idle";
-  const phasePretty =
-    phaseLabel === "evaluate_claim"
-      ? "Evaluating claim"
-      : phaseLabel === "execute"
-        ? "Executing bounty"
-        : phaseLabel === "merge"
-          ? "Merging perspectives"
-          : phaseLabel;
+  const prettyPhase = phasePretty(phaseLabel);
+  const toolText = insight?.toolText ?? "";
+  const modelText = insight?.modelText ?? "";
+  const hasTools = toolText.length > 0;
+  const hasModel = modelText.length > 0;
+  const bountyActive = Boolean(insight?.bountyId);
+  const waitingWork =
+    bountyActive &&
+    telemetryEnabled === true &&
+    !hasTools &&
+    !hasModel &&
+    phaseLabel !== "idle";
+
+  let emptyMessage: string | null = null;
+  if (telemetryEnabled === false) {
+    emptyMessage =
+      "Live stream disabled — set BRIDGE_TELEMETRY_SECRET on agenc-api and WORKER_TELEMETRY_SECRET on workers (same value), then restart.";
+  } else if (telemetryEnabled === null) {
+    emptyMessage = "Checking telemetry…";
+  } else if (!bountyActive && !hasTools && !hasModel) {
+    emptyMessage =
+      "Idle — broadcast a bounty and select this worker during claim or execution to see the stream.";
+  } else if (waitingWork) {
+    emptyMessage = "Waiting for tokens…";
+  }
 
   return (
     <>
@@ -61,7 +129,7 @@ export function WorkerInsightBubble({
         onClick={onClose}
       />
       <div
-        className="pointer-events-auto fixed z-[50] w-[min(420px,calc(100vw-2rem))]"
+        className="pointer-events-auto fixed z-[50] w-[min(440px,calc(100vw-2rem))]"
         style={{
           left: anchor.x,
           top: anchor.y,
@@ -99,11 +167,20 @@ export function WorkerInsightBubble({
               </button>
             </div>
             <div className="mt-2 flex flex-wrap gap-2 text-[10px]">
+              <span
+                className={`rounded-full border px-2 py-0.5 font-mono ${
+                  sseConnected
+                    ? "border-emerald-500/35 bg-emerald-500/10 text-emerald-300/90"
+                    : "border-amber-500/40 bg-amber-500/10 text-amber-200/90"
+                }`}
+              >
+                {sseConnected ? "SSE live" : "SSE reconnecting…"}
+              </span>
               <span className="rounded-full border border-zinc-700/80 bg-zinc-900/80 px-2 py-0.5 font-mono text-zinc-400">
                 status: {agentStatus}
               </span>
               <span className="rounded-full border border-emerald-500/20 bg-emerald-500/10 px-2 py-0.5 font-mono text-emerald-400/90">
-                {phasePretty}
+                {prettyPhase}
               </span>
               {insight?.bountyId && (
                 <span className="rounded-full border border-zinc-700/80 px-2 py-0.5 font-mono text-zinc-500">
@@ -116,27 +193,62 @@ export function WorkerInsightBubble({
                 </span>
               )}
             </div>
+            {telemetryEnabled === false && (
+              <p className="mt-2 rounded-lg border border-amber-500/25 bg-amber-500/5 px-2 py-1.5 text-[10px] leading-snug text-amber-200/90">
+                Dashboard streaming is off until the bridge enables telemetry (
+                <code className="text-amber-100/90">BRIDGE_TELEMETRY_SECRET</code>
+                ).
+              </p>
+            )}
           </div>
 
-          <div className="relative px-3 pb-3 pt-2">
-            <p className="mb-1.5 text-[9px] uppercase tracking-[0.18em] text-zinc-600">
-              Model stream
-            </p>
-            <div
-              className="max-h-[min(220px,40vh)] overflow-y-auto rounded-xl border border-zinc-800/60 bg-[#050506]/90 px-3 py-2 font-mono text-[11px] leading-relaxed text-emerald-100/90 shadow-inner motion-safe:[box-shadow:inset_0_0_24px_rgba(16,185,129,0.06)]"
-              style={{ tabSize: 2 }}
-            >
-              <span className="motion-safe:animate-[pulse_3s_ease-in-out_infinite] text-emerald-500/50">
-                ▸{" "}
-              </span>
-              {insight?.text ? (
-                <span className="whitespace-pre-wrap break-words">{insight.text}</span>
-              ) : (
-                <span className="text-zinc-600">
-                  Waiting for tokens… select during an active bounty.
-                </span>
-              )}
-              <div ref={endRef} />
+          <div className="relative space-y-3 px-3 pb-3 pt-2">
+            <div>
+              <p className="mb-1 text-[9px] uppercase tracking-[0.18em] text-zinc-600">
+                Tools
+              </p>
+              <div
+                className="max-h-[min(120px,22vh)] overflow-y-auto rounded-xl border border-zinc-800/60 bg-[#060607]/95 px-3 py-2 font-mono text-[10px] leading-relaxed text-zinc-300 shadow-inner"
+                style={{ tabSize: 2 }}
+              >
+                {hasTools ? (
+                  <>
+                    <span className="whitespace-pre-wrap break-words">{toolText}</span>
+                    <StreamCursor reducedMotion={reducedMotion} />
+                    <div ref={toolEndRef} />
+                  </>
+                ) : (
+                  <span className="text-zinc-600">No tool I/O yet for this run.</span>
+                )}
+              </div>
+            </div>
+
+            <div>
+              <p className="mb-1 text-[9px] uppercase tracking-[0.18em] text-zinc-600">
+                Model stream
+              </p>
+              <div
+                className="max-h-[min(200px,32vh)] overflow-y-auto rounded-xl border border-zinc-800/60 bg-[#050506]/90 px-3 py-2 text-[12px] leading-relaxed text-zinc-200 shadow-inner motion-safe:[box-shadow:inset_0_0_24px_rgba(16,185,129,0.06)]"
+                style={{ tabSize: 2 }}
+              >
+                {hasModel ? (
+                  <>
+                    <span className="whitespace-pre-wrap break-words">{modelText}</span>
+                    <StreamCursor reducedMotion={reducedMotion} />
+                    <div ref={modelEndRef} />
+                  </>
+                ) : emptyMessage ? (
+                  <span className="text-zinc-500">
+                    <span className="text-emerald-500/50">▸ </span>
+                    {emptyMessage}
+                  </span>
+                ) : (
+                  <span className="text-zinc-600">
+                    <span className="text-emerald-500/50">▸ </span>
+                    Waiting for model output…
+                  </span>
+                )}
+              </div>
             </div>
           </div>
         </div>

@@ -831,6 +831,12 @@ def get_nodes() -> dict:
     return node_states
 
 
+@app.get("/api/telemetry/status")
+def get_telemetry_status() -> dict[str, bool]:
+    """Whether the bridge accepts worker POST /api/worker/telemetry (dashboard streaming)."""
+    return {"enabled": bool(config.BRIDGE_TELEMETRY_SECRET)}
+
+
 @app.get("/api/bounties")
 def get_bounties() -> dict:
     return bounties

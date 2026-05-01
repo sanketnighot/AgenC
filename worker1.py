@@ -15,6 +15,7 @@ from openai import OpenAI
 
 from worker_telemetry import (
     emit_mock_stream_chunks,
+    log_worker_telemetry_startup,
     new_stream_id,
     stream_completion_text,
 )
@@ -575,6 +576,7 @@ async def recv_loop() -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main() -> None:
+    log_worker_telemetry_startup(logger)
     logger.info(
         "AgenC Worker [%s] online — %s/%s. Listening…",
         SPECIALTY, PROVIDER, MODEL,

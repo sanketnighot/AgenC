@@ -296,6 +296,8 @@ function FlowInner({
   selectedWorkerKey,
   onWorkerSelect,
   insight,
+  telemetryEnabled,
+  sseConnected,
 }: {
   emitterLabel: string;
   workers: MeshWorkerView[];
@@ -304,6 +306,8 @@ function FlowInner({
   selectedWorkerKey: string | null;
   onWorkerSelect: (nodeKey: string | null) => void;
   insight: InsightPayload | null;
+  telemetryEnabled: boolean | null;
+  sseConnected: boolean;
 }) {
   const { fitView, flowToScreenPosition, getNode } = useReactFlow();
   useStore((s) => s.transform);
@@ -435,6 +439,8 @@ function FlowInner({
         workerLabel={selectedWorker?.label ?? ""}
         agentStatus={selectedAgent?.status ?? "idle"}
         insight={insight}
+        telemetryEnabled={telemetryEnabled}
+        sseConnected={sseConnected}
         onClose={() => onWorkerSelect(null)}
       />
     </div>
@@ -449,6 +455,8 @@ export function MeshFlowMap({
   selectedWorkerKey,
   onWorkerSelect,
   insight,
+  telemetryEnabled,
+  sseConnected,
 }: {
   emitter: AgentNodeState;
   workers: MeshWorkerView[];
@@ -457,6 +465,8 @@ export function MeshFlowMap({
   selectedWorkerKey: string | null;
   onWorkerSelect: (nodeKey: string | null) => void;
   insight: InsightPayload | null;
+  telemetryEnabled: boolean | null;
+  sseConnected: boolean;
 }) {
   return (
     <ReactFlowProvider>
@@ -468,6 +478,8 @@ export function MeshFlowMap({
         selectedWorkerKey={selectedWorkerKey}
         onWorkerSelect={onWorkerSelect}
         insight={insight}
+        telemetryEnabled={telemetryEnabled}
+        sseConnected={sseConnected}
       />
     </ReactFlowProvider>
   );

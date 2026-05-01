@@ -110,6 +110,19 @@ def test_telemetry_ok(secret, monkeypatch):
     assert deltas[0]["node_key"] == "worker_2"
 
 
+def test_telemetry_status_enabled(secret):
+    client = TestClient(secret)
+    assert client.get("/api/telemetry/status").json() == {"enabled": True}
+
+
+def test_telemetry_status_disabled(monkeypatch):
+    monkeypatch.setattr(config, "BRIDGE_TELEMETRY_SECRET", "")
+    from main import app
+
+    client = TestClient(app)
+    assert client.get("/api/telemetry/status").json() == {"enabled": False}
+
+
 def test_telemetry_disabled_when_empty_secret(monkeypatch):
     monkeypatch.setattr(config, "BRIDGE_TELEMETRY_SECRET", "")
     import main

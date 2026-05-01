@@ -333,10 +333,27 @@ function AuctionBountyRail({
   );
 }
 
-const INSIGHT_TEXT_CAP = 32000;
+const INSIGHT_MODEL_CAP = 24000;
+const INSIGHT_TOOL_CAP = 8000;
+
+function capInsightTail(s: string, max: number): string {
+  if (s.length <= max) return s;
+  return s.slice(-max);
+}
+
+/** Reset tool/model buffers when SSE carries a different bounty_id for this worker. */
+function shouldResetInsightForBounty(
+  prevBountyId: string | undefined,
+  incomingBountyId: string | null | undefined,
+): boolean {
+  if (incomingBountyId == null || incomingBountyId === "") return false;
+  if (prevBountyId == null || prevBountyId === "") return false;
+  return incomingBountyId !== prevBountyId;
+}
 
 interface WorkerInsightBuf {
-  text: string;
+  toolText: string;
+  modelText: string;
   phase: string;
   bountyId?: string;
   specialty?: string;
@@ -366,17 +383,35 @@ export default function Home() {
   const [selectedInsightWorker, setSelectedInsightWorker] = useState<
     string | null
   >(null);
+  const [telemetryEnabled, setTelemetryEnabled] = useState<boolean | null>(null);
+  const [sseConnected, setSseConnected] = useState(false);
 
   const panelInsight: InsightPayload | null = useMemo(() => {
     if (!selectedInsightWorker) return null;
     const x = workerInsights[selectedInsightWorker];
     return {
-      text: x?.text ?? "",
+      toolText: x?.toolText ?? "",
+      modelText: x?.modelText ?? "",
       phase: x?.phase ?? "idle",
       bountyId: x?.bountyId,
       specialty: x?.specialty,
     };
   }, [selectedInsightWorker, workerInsights]);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`${API}/api/telemetry/status`)
+      .then((r) => r.json())
+      .then((body: { enabled?: boolean }) => {
+        if (!cancelled) setTelemetryEnabled(Boolean(body.enabled));
+      })
+      .catch(() => {
+        if (!cancelled) setTelemetryEnabled(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const meshWorkersRef = useRef(meshWorkers);
   useEffect(() => {
@@ -444,6 +479,9 @@ export default function Home() {
   useEffect(() => {
     const es = new EventSource(`${API}/api/events`);
 
+    es.onopen = () => setSseConnected(true);
+    es.onerror = () => setSseConnected(false);
+
     es.addEventListener("mesh_state", (e) => {
       const data = JSON.parse(e.data) as { workers?: MeshWorkerView[] };
       if (Array.isArray(data.workers)) {
@@ -475,20 +513,33 @@ export default function Home() {
       const k = d.node_key;
       setWorkerInsights((prev) => {
         const cur = prev[k] ?? {
-          text: "",
+          toolText: "",
+          modelText: "",
           phase: "idle",
           specialty: d.specialty,
         };
-        let text = cur.text + (d.delta || "");
-        if (text.length > INSIGHT_TEXT_CAP) {
-          text = text.slice(-INSIGHT_TEXT_CAP);
+        const reset = shouldResetInsightForBounty(
+          cur.bountyId,
+          d.bounty_id,
+        );
+        let toolText = reset ? "" : cur.toolText;
+        let modelText = reset ? "" : cur.modelText;
+        const bountyId = reset
+          ? (d.bounty_id ?? undefined)
+          : (d.bounty_id ?? cur.bountyId);
+        const chunk = d.delta || "";
+        if (d.phase === "tool") {
+          toolText = capInsightTail(toolText + chunk, INSIGHT_TOOL_CAP);
+        } else {
+          modelText = capInsightTail(modelText + chunk, INSIGHT_MODEL_CAP);
         }
         return {
           ...prev,
           [k]: {
-            text,
+            toolText,
+            modelText,
             phase: d.phase,
-            bountyId: d.bounty_id ?? cur.bountyId,
+            bountyId,
             specialty: d.specialty ?? cur.specialty,
           },
         };
@@ -502,13 +553,22 @@ export default function Home() {
       };
       const k = d.node_key;
       setWorkerInsights((prev) => {
-        const cur = prev[k] ?? { text: "", phase: "idle" };
+        const cur = prev[k] ?? {
+          toolText: "",
+          modelText: "",
+          phase: "idle",
+        };
+        const reset = shouldResetInsightForBounty(cur.bountyId, d.bounty_id);
         return {
           ...prev,
           [k]: {
             ...cur,
+            toolText: reset ? "" : cur.toolText,
+            modelText: reset ? "" : cur.modelText,
             phase: d.phase,
-            bountyId: d.bounty_id ?? cur.bountyId,
+            bountyId: reset
+              ? (d.bounty_id ?? undefined)
+              : (d.bounty_id ?? cur.bountyId),
           },
         };
       });
@@ -725,6 +785,8 @@ export default function Home() {
         selectedWorkerKey={selectedInsightWorker}
         onWorkerSelect={setSelectedInsightWorker}
         insight={panelInsight}
+        telemetryEnabled={telemetryEnabled}
+        sseConnected={sseConnected}
       />
 
       {/* Layer z-10: Header */}
