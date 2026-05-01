@@ -310,6 +310,9 @@ def select_winner_llm(
 
     compact = []
     for c in claims:
+        caps = c.get("capabilities")
+        if not isinstance(caps, dict):
+            caps = {}
         compact.append(
             {
                 "node_key": c.get("node_key"),
@@ -317,6 +320,7 @@ def select_winner_llm(
                 "fit_score": c.get("fit_score"),
                 "claim_rationale": (c.get("claim_rationale") or "")[:400],
                 "peer_short_id": (c.get("from_peer") or "")[:8],
+                "capabilities": caps,
             }
         )
 
@@ -331,7 +335,8 @@ def select_winner_llm(
 
     system = (
         "You are a neutral routing arbiter for agent bounties. "
-        "Given a task and competing CLAIM entries, decide whether one agent should handle "
+        "Given a task and competing CLAIM entries (including optional per-agent tool capabilities), "
+        "decide whether one agent should handle "
         "it alone (winner_take_all) or all specialists should collaborate (collaborate). "
         "winner_node_key MUST be copied EXACTLY from allowed_node_keys (e.g. worker_1) — "
         "never invent IDs. For collaborate mode, winner_node_key is the lead collaborator. "

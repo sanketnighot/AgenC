@@ -18,6 +18,9 @@ from worker_telemetry import (
     new_stream_id,
     stream_completion_text,
 )
+from worker_tools.base import ToolContext
+from worker_tools.local_registry import capability_manifest_for, tools_for_data_analyst
+from worker_tools.runtime import run_agent_with_tools
 
 logging.basicConfig(
     level=logging.INFO,
@@ -84,10 +87,13 @@ client = OpenAI(
 # ── Personality ───────────────────────────────────────────────────────────────
 
 SPECIALTY = "Data Analyst"
+CAPABILITIES = capability_manifest_for("data")
 SYSTEM_PROMPT = (
     "You are a Data Analyst agent on the AgenC decentralized network. "
     "You specialize in quantitative analysis, statistics, and financial data. "
-    "Be precise, cite numbers, keep answers under 4 sentences."
+    "When you need live crypto prices, Uniswap pool liquidity/TVL, web sources, or a scratchpad, "
+    "use your tools instead of inventing numbers. "
+    "Be precise, cite numbers, keep answers under 6 sentences unless the bounty demands detail."
 )
 MOCK_RESULT = "MOCK: ETH showed 0.72 correlation to CPI over 5 years based on historical data."
 
@@ -126,7 +132,9 @@ _CLAIM_JSON_INSTRUCTION_DA = (
     "should_claim true when the task involves data, metrics, statistics, quantitative "
     "analysis, volatility, markets, spreadsheets, or numeric reasoning. "
     "fit_score = how strong your specialty fit is. When uncertain, lean toward claiming "
-    "if there is any analytical angle."
+    "if there is any analytical angle.\n"
+    f"You have tools (IDs): {CAPABILITIES.get('tool_ids', [])}. Mention in claim_rationale "
+    "if a tool is critical to satisfying the task."
 )
 
 
@@ -205,19 +213,23 @@ def process_task_with_prompt(
             stream_id=sid,
         )
         return MOCK_RESULT
-    text = stream_completion_text(
-        client,
-        MODEL,
-        [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Execute this bounty: {task}"},
-        ],
+    ctx = ToolContext(
         node_key=OWN_NODE_KEY,
-        phase="execute",
         bounty_id=bounty_id,
         stream_id=sid,
-        max_tokens=150,
-        timeout=60.0,
+        worker_api_base=WORKER_API,
+    )
+    tools = tools_for_data_analyst(WORKER_API)
+    text = run_agent_with_tools(
+        client,
+        MODEL,
+        system_prompt,
+        task,
+        tools,
+        ctx=ctx,
+        mock_mode=False,
+        max_tokens=1500,
+        timeout=90.0,
     )
     if not text.strip():
         return "AI Execution Error: empty response"
@@ -493,6 +505,7 @@ async def handle_new_bounty(from_peer: str, payload: dict) -> None:
                 "fit_score": ev["fit_score"],
                 "claim_rationale": ev["claim_rationale"],
                 "confidence": "high",
+                "capabilities": CAPABILITIES,
             })
             if not ok:
                 logger.warning("[send_fail] CLAIM not delivered for #%s", bounty_id)

@@ -42,3 +42,7 @@ scratchpad.txt
 
 # envs
 *.env
+
+# logs
+*.log
+artifacts/

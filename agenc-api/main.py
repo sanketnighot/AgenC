@@ -23,7 +23,7 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
-_TELEMETRY_PHASES = frozenset({"evaluate_claim", "execute", "merge", "idle"})
+_TELEMETRY_PHASES = frozenset({"evaluate_claim", "execute", "merge", "idle", "tool"})
 
 app = FastAPI()
 
@@ -42,11 +42,34 @@ WORKER_NODES = {
         "peer_id": "7f735488b692e04fbb3071c4ad6a2774bd0ec3bb7b5508e09a0d00a31af0e5f4",
         "specialty": "Data Analyst",
         "api": "http://127.0.0.1:8002",
+        "capabilities": {
+            "tool_ids": [
+                "market_price_usd",
+                "uniswap_v3_pool_snapshot",
+                "web_search",
+                "shared_memory_put",
+                "shared_memory_get",
+                "shared_memory_list",
+            ],
+            "tool_classes": ["market_data", "defi", "price_feed", "web_search", "memory"],
+            "supports_artifact_output": False,
+        },
     },
     "worker_2": {
         "peer_id": "68ed6920e3d1b7b8ceaf8519006ab614f76cb23738ebf06f364426b8000fe8c0",
         "specialty": "Creative Strategist",
         "api": "http://127.0.0.1:8003",
+        "capabilities": {
+            "tool_ids": [
+                "gemini_generate_image",
+                "web_search",
+                "shared_memory_put",
+                "shared_memory_get",
+                "shared_memory_list",
+            ],
+            "tool_classes": ["image_generation", "creative", "web_search", "memory"],
+            "supports_artifact_output": True,
+        },
     },
 }
 
@@ -158,6 +181,7 @@ def build_mesh_state() -> dict:
                 "peer_id": pid,
                 "short_id": pid[:8],
                 "mesh_connected": up,
+                "capabilities": w.get("capabilities") or {},
             }
         )
     emitter_pk = topo.get("our_public_key") if isinstance(topo, dict) else ""
@@ -532,12 +556,16 @@ async def handle_inbound(from_peer: str, payload: dict) -> None:
                     bb["pending_claims"] = {}
 
                 fp = from_peer.strip().lower()
+                caps = payload.get("capabilities")
+                if not isinstance(caps, dict):
+                    caps = {}
                 bb["pending_claims"][fp] = {
                     "from_peer": fp,
                     "node_key": node_key,
                     "specialty": specialty,
                     "fit_score": fit_score,
                     "claim_rationale": rationale,
+                    "capabilities": caps,
                     "received_at": time.time(),
                 }
 

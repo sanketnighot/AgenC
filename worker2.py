@@ -18,6 +18,9 @@ from worker_telemetry import (
     new_stream_id,
     stream_completion_text,
 )
+from worker_tools.base import ToolContext
+from worker_tools.local_registry import capability_manifest_for, tools_for_creative_strategist
+from worker_tools.runtime import run_agent_with_tools
 
 logging.basicConfig(
     level=logging.INFO,
@@ -84,10 +87,13 @@ client = OpenAI(
 # ── Personality ───────────────────────────────────────────────────────────────
 
 SPECIALTY = "Creative Strategist"
+CAPABILITIES = capability_manifest_for("creative")
 SYSTEM_PROMPT = (
     "You are a Creative Strategist agent on the AgenC decentralized network. "
     "You specialize in narrative framing, creative ideas, and strategic positioning. "
-    "Be bold, original, and inspiring. Keep answers under 4 sentences."
+    "You have tools for web search, shared scratchpad memory, and Gemini image generation — "
+    "use them when the bounty needs visuals or external references. "
+    "Be bold and inspiring; keep prose concise unless the bounty requires depth."
 )
 MOCK_RESULT = "MOCK: Position ETH as 'digital gold 2.0' — inflation-resistant, programmable, and battle-tested."
 
@@ -128,7 +134,8 @@ _CLAIM_JSON_INSTRUCTION_CR = (
     "deliverable should be framed for executives or the public. "
     "For purely quantitative tasks (volatility, statistics, raw numbers), still set "
     "should_claim TRUE with a lower fit_score (0.35–0.55) if you can add positioning or "
-    "executive-summary value; only decline when there is zero creative or communication angle."
+    "executive-summary value; only decline when there is zero creative or communication angle.\n"
+    f"Your tools (IDs): {CAPABILITIES.get('tool_ids', [])}."
 )
 
 
@@ -207,19 +214,23 @@ def process_task_with_prompt(
             stream_id=sid,
         )
         return MOCK_RESULT
-    text = stream_completion_text(
-        client,
-        MODEL,
-        [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Execute this bounty: {task}"},
-        ],
+    ctx = ToolContext(
         node_key=OWN_NODE_KEY,
-        phase="execute",
         bounty_id=bounty_id,
         stream_id=sid,
-        max_tokens=150,
-        timeout=60.0,
+        worker_api_base=WORKER_API,
+    )
+    tools = tools_for_creative_strategist(WORKER_API)
+    text = run_agent_with_tools(
+        client,
+        MODEL,
+        system_prompt,
+        task,
+        tools,
+        ctx=ctx,
+        mock_mode=False,
+        max_tokens=1500,
+        timeout=120.0,
     )
     if not text.strip():
         return "AI Execution Error: empty response"
@@ -489,6 +500,7 @@ async def handle_new_bounty(from_peer: str, payload: dict) -> None:
                 "fit_score": ev["fit_score"],
                 "claim_rationale": ev["claim_rationale"],
                 "confidence": "high",
+                "capabilities": CAPABILITIES,
             })
             if not ok:
                 logger.warning("[send_fail] CLAIM not delivered for #%s", bounty_id)
