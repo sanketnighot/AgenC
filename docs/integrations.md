@@ -120,6 +120,21 @@ python examples/python-client/a2a_client.py \
   --service weather --method tools/list
 ```
 
+## AgenC MCP sidecars (web search + shared memory)
+
+For hackathon demos, you can run additional **MCP HTTP services** that register with the same **`mcp_router`** used by the Go node:
+
+| Script (after `pip install -e .` in `integrations/`) | Port (default) | Service name (for `/mcp/{peer}/{service}`) |
+|--------------------------------------------------------|----------------|---------------------------------------------|
+| `agenc-web-search-mcp` | 9101 | `web-search` |
+| `agenc-shared-memory-mcp` | 9102 | `shared-memory` |
+
+1. Start **`python -m mcp_routing.mcp_router`** (or `mcp-router`) on **9003**.
+2. Start **`agenc-web-search-mcp`** and **`agenc-shared-memory-mcp`** — they self-register with the router.
+3. Set **`MCP_SERVICE_PEER_ID`** in worker `.env` to the **64-char hex public key** of the node where MCP traffic should land (typically the emitter). Workers invoke tools via their **local** node URL `WORKER_API`: `POST http://127.0.0.1:<node>/mcp/{MCP_SERVICE_PEER_ID}/web-search`.
+
+---
+
 ## Tests
 
 ```bash

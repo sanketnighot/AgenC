@@ -34,6 +34,7 @@ Together this follows the **[GStack](https://github.com/garrytan/gstack)** patte
 ### 3. Agent intelligence
 
 - **Default model:** OpenAI **`gpt-4o-mini`** for low-latency task execution on workers (configurable per deployment).
+- **Tools:** Workers may expose **OpenAI-style tools** for market data (CoinGecko + Uniswap subgraph), **Gemini image generation**, and shared **MCP** services (`web-search`, `shared-memory`) reached via the local node **`POST /mcp/{peer_id}/{service}`** when `MCP_SERVICE_PEER_ID` is configured.
 - **Extensibility:** Worker behavior is modular (e.g. auditor, researcher, coder personas) as separate processes or router paths, still speaking the same bounty protocol over AXL.
 
 ---
@@ -65,7 +66,12 @@ After `NEW_BOUNTY`, workers MAY bid with a **CLAIM** message. The bridge collect
   "specialty": "Data Analyst",
   "fit_score": 0.82,
   "claim_rationale": "Task requires statistical comparison; strong match.",
-  "confidence": "high"
+  "confidence": "high",
+  "capabilities": {
+    "tool_ids": ["market_price_usd", "uniswap_v3_pool_snapshot", "web_search"],
+    "tool_classes": ["market_data", "defi", "web_search"],
+    "supports_artifact_output": false
+  }
 }
 ```
 
@@ -76,6 +82,7 @@ After `NEW_BOUNTY`, workers MAY bid with a **CLAIM** message. The bridge collect
 | `fit_score` | Self-assessed fit in **0.0–1.0** (recommended). |
 | `claim_rationale` | Short sentence for the bridge arbiter (optional; truncated server-side). |
 | `confidence` | Legacy hint (`high` / `medium` / `low`); used only if `fit_score` is absent. |
+| `capabilities` | Optional manifest (`tool_ids`, `tool_classes`, `supports_artifact_output`) so the arbiter can prefer agents with the right tools. |
 
 ### C. Award / rejection (Emitter → Worker)
 
