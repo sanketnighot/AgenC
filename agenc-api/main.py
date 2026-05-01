@@ -6,10 +6,11 @@ import uuid
 from typing import AsyncGenerator
 
 import requests
-from fastapi import FastAPI, Request
+import config
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from arbiter import normalize_fit_score, resolve_winner
 from config import (
@@ -21,6 +22,8 @@ from config import (
 )
 
 logger = logging.getLogger(__name__)
+
+_TELEMETRY_PHASES = frozenset({"evaluate_claim", "execute", "merge", "idle"})
 
 app = FastAPI()
 
@@ -662,6 +665,73 @@ async def events(request: Request) -> StreamingResponse:
 class Bounty(BaseModel):
     task: str
     reward: str
+
+
+class WorkerTelemetryIn(BaseModel):
+    """Inbound chunks from worker processes for SSE fan-out (worker_llm_delta)."""
+
+    node_key: str
+    stream_id: str
+    phase: str
+    bounty_id: str | None = None
+    delta: str = ""
+    done: bool = False
+
+    @field_validator("phase")
+    @classmethod
+    def phase_ok(cls, v: str) -> str:
+        if v not in _TELEMETRY_PHASES:
+            raise ValueError(f"phase must be one of {sorted(_TELEMETRY_PHASES)}")
+        return v
+
+
+@app.post("/api/worker/telemetry")
+async def post_worker_telemetry(
+    body: WorkerTelemetryIn,
+    x_telemetry_secret: str | None = Header(None, alias="X-Telemetry-Secret"),
+) -> dict:
+    """Workers POST streamed LLM deltas; bridge broadcasts SSE `worker_llm_delta` (+ `worker_phase`)."""
+    if not config.BRIDGE_TELEMETRY_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail="Telemetry disabled (set BRIDGE_TELEMETRY_SECRET on bridge)",
+        )
+    if not x_telemetry_secret or x_telemetry_secret != config.BRIDGE_TELEMETRY_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid telemetry secret")
+
+    if body.node_key not in WORKER_NODES:
+        raise HTTPException(status_code=400, detail="Unknown node_key")
+
+    delta = body.delta
+    if len(delta.encode("utf-8")) > config.MAX_TELEMETRY_DELTA_BYTES:
+        logger.warning(
+            "telemetry delta truncated from %s bytes", len(delta.encode("utf-8"))
+        )
+        delta = delta.encode("utf-8")[: config.MAX_TELEMETRY_DELTA_BYTES].decode(
+            "utf-8", errors="ignore"
+        )
+
+    payload = {
+        "node_key": body.node_key,
+        "stream_id": body.stream_id,
+        "phase": body.phase,
+        "bounty_id": body.bounty_id,
+        "delta": delta,
+        "done": body.done,
+        "specialty": WORKER_NODES[body.node_key]["specialty"],
+    }
+    await broadcast("worker_llm_delta", payload)
+    await broadcast(
+        "worker_phase",
+        {
+            "node_key": body.node_key,
+            "phase": body.phase,
+            "bounty_id": body.bounty_id,
+            "stream_id": body.stream_id,
+            "done": body.done,
+        },
+    )
+    return {"status": "ok"}
 
 
 @app.post("/api/bounty")

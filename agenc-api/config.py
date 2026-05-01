@@ -41,3 +41,14 @@ ARBITER_SKIP_WHEN_UNANIMOUS = (
     os.environ.get("ARBITER_SKIP_WHEN_UNANIMOUS", "false").lower()
     in ("1", "true", "yes")
 )
+
+# When the LLM arbiter fails (invalid JSON, wrong keys), infer collaborate mode if the task
+# clearly spans multiple domains and distinct specialists claimed (see arbiter.heuristic_collaboration_outcome).
+ARBITER_HEURISTIC_COLLAB = (
+    os.environ.get("ARBITER_HEURISTIC_COLLAB", "true").lower()
+    in ("1", "true", "yes")
+)
+
+# Worker → bridge LLM telemetry (SSE fan-out to dashboard)
+BRIDGE_TELEMETRY_SECRET = os.environ.get("BRIDGE_TELEMETRY_SECRET", "").strip()
+MAX_TELEMETRY_DELTA_BYTES = int(os.environ.get("MAX_TELEMETRY_DELTA", "8192"))

@@ -2,6 +2,7 @@
 
 import "@xyflow/react/dist/style.css";
 
+import type { MouseEvent } from "react";
 import { useCallback, useEffect, useMemo } from "react";
 import {
   Background,
@@ -13,12 +14,14 @@ import {
   useEdgesState,
   useNodesState,
   useReactFlow,
+  useStore,
   type Edge,
   type Node,
   type NodeProps,
 } from "@xyflow/react";
 
 import type { MeshPacket } from "@/lib/meshPackets";
+import { WorkerInsightBubble, type InsightPayload } from "@/components/WorkerInsightBubble";
 
 import type { MeshWorkerView } from "@/types/mesh";
 
@@ -290,13 +293,20 @@ function FlowInner({
   workers,
   agentStates,
   meshPackets,
+  selectedWorkerKey,
+  onWorkerSelect,
+  insight,
 }: {
   emitterLabel: string;
   workers: MeshWorkerView[];
   agentStates: Record<string, AgentNodeState>;
   meshPackets: MeshPacket[];
+  selectedWorkerKey: string | null;
+  onWorkerSelect: (nodeKey: string | null) => void;
+  insight: InsightPayload | null;
 }) {
-  const { fitView } = useReactFlow();
+  const { fitView, flowToScreenPosition, getNode } = useReactFlow();
+  useStore((s) => s.transform);
 
   const initialNodes = useMemo(
     () => buildNodes(emitterLabel, workers, agentStates),
@@ -309,6 +319,17 @@ function FlowInner({
 
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
+
+  const anchor = useMemo(() => {
+    if (!selectedWorkerKey) return null;
+    const nd = getNode(selectedWorkerKey);
+    if (!nd || nd.type !== "worker") return null;
+    const nw = 128;
+    return flowToScreenPosition({
+      x: nd.position.x + nw / 2,
+      y: nd.position.y,
+    });
+  }, [selectedWorkerKey, getNode, flowToScreenPosition, nodes]);
 
   const workerIdsKey = workers.map((w) => w.node_key).join("|");
 
@@ -337,6 +358,25 @@ function FlowInner({
   const onInit = useCallback(() => {
     fitView({ padding: 0.28, maxZoom: 1.15 });
   }, [fitView]);
+
+  const onNodeClick = useCallback(
+    (_event: MouseEvent, node: Node) => {
+      if (node.type === "worker") {
+        onWorkerSelect(selectedWorkerKey === node.id ? null : node.id);
+      }
+    },
+    [onWorkerSelect, selectedWorkerKey],
+  );
+
+  const onPaneClick = useCallback(() => {
+    onWorkerSelect(null);
+  }, [onWorkerSelect]);
+
+  const selectedWorker = workers.find((w) => w.node_key === selectedWorkerKey);
+  const selectedAgent =
+    selectedWorkerKey && agentStates[selectedWorkerKey]
+      ? agentStates[selectedWorkerKey]
+      : null;
 
   const n = workers.length;
 
@@ -370,6 +410,8 @@ function FlowInner({
             zoomOnScroll
             zoomOnPinch
             panOnDrag
+            onNodeClick={onNodeClick}
+            onPaneClick={onPaneClick}
             defaultEdgeOptions={{ type: "smoothstep" }}
             className="!bg-transparent [&_.react-flow__edge-path]:!stroke-linecap-round [&_.react-flow__attribution]:hidden!"
           >
@@ -387,6 +429,14 @@ function FlowInner({
           </ReactFlow>
         )}
       </div>
+      <WorkerInsightBubble
+        open={Boolean(selectedWorkerKey && selectedWorker)}
+        anchor={anchor}
+        workerLabel={selectedWorker?.label ?? ""}
+        agentStatus={selectedAgent?.status ?? "idle"}
+        insight={insight}
+        onClose={() => onWorkerSelect(null)}
+      />
     </div>
   );
 }
@@ -396,11 +446,17 @@ export function MeshFlowMap({
   workers,
   agentStates,
   meshPackets,
+  selectedWorkerKey,
+  onWorkerSelect,
+  insight,
 }: {
   emitter: AgentNodeState;
   workers: MeshWorkerView[];
   agentStates: Record<string, AgentNodeState>;
   meshPackets: MeshPacket[];
+  selectedWorkerKey: string | null;
+  onWorkerSelect: (nodeKey: string | null) => void;
+  insight: InsightPayload | null;
 }) {
   return (
     <ReactFlowProvider>
@@ -409,6 +465,9 @@ export function MeshFlowMap({
         workers={workers}
         agentStates={agentStates}
         meshPackets={meshPackets}
+        selectedWorkerKey={selectedWorkerKey}
+        onWorkerSelect={onWorkerSelect}
+        insight={insight}
       />
     </ReactFlowProvider>
   );

@@ -2,6 +2,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 
 import { MeshFlowMap } from "@/components/MeshFlowMap";
+import type { InsightPayload } from "@/components/WorkerInsightBubble";
 import type { MeshWorkerView } from "@/types/mesh";
 import {
   resolveWorkerNodeBySpecialty,
@@ -311,6 +312,15 @@ function AuctionBountyRail({
   );
 }
 
+const INSIGHT_TEXT_CAP = 32000;
+
+interface WorkerInsightBuf {
+  text: string;
+  phase: string;
+  bountyId?: string;
+  specialty?: string;
+}
+
 // ── Home ──────────────────────────────────────────────────────────────────────
 
 export default function Home() {
@@ -329,6 +339,24 @@ export default function Home() {
   });
   const [meshWorkers, setMeshWorkers] = useState<MeshWorkerView[]>([]);
   const [meshPackets, setMeshPackets] = useState<MeshPacket[]>([]);
+  const [workerInsights, setWorkerInsights] = useState<
+    Record<string, WorkerInsightBuf>
+  >({});
+  const [selectedInsightWorker, setSelectedInsightWorker] = useState<
+    string | null
+  >(null);
+
+  const panelInsight: InsightPayload | null = useMemo(() => {
+    if (!selectedInsightWorker) return null;
+    const x = workerInsights[selectedInsightWorker];
+    return {
+      text: x?.text ?? "",
+      phase: x?.phase ?? "idle",
+      bountyId: x?.bountyId,
+      specialty: x?.specialty,
+    };
+  }, [selectedInsightWorker, workerInsights]);
+
   const meshWorkersRef = useRef(meshWorkers);
   useEffect(() => {
     meshWorkersRef.current = meshWorkers;
@@ -414,6 +442,55 @@ export default function Home() {
     es.addEventListener("node_status", (e) => {
       const { node_id, status } = JSON.parse(e.data);
       setNodeStatus(node_id, status as NodeStatus);
+    });
+    es.addEventListener("worker_llm_delta", (e) => {
+      const d = JSON.parse(e.data) as {
+        node_key: string;
+        phase: string;
+        bounty_id?: string | null;
+        delta: string;
+        specialty?: string;
+      };
+      const k = d.node_key;
+      setWorkerInsights((prev) => {
+        const cur = prev[k] ?? {
+          text: "",
+          phase: "idle",
+          specialty: d.specialty,
+        };
+        let text = cur.text + (d.delta || "");
+        if (text.length > INSIGHT_TEXT_CAP) {
+          text = text.slice(-INSIGHT_TEXT_CAP);
+        }
+        return {
+          ...prev,
+          [k]: {
+            text,
+            phase: d.phase,
+            bountyId: d.bounty_id ?? cur.bountyId,
+            specialty: d.specialty ?? cur.specialty,
+          },
+        };
+      });
+    });
+    es.addEventListener("worker_phase", (e) => {
+      const d = JSON.parse(e.data) as {
+        node_key: string;
+        phase: string;
+        bounty_id?: string | null;
+      };
+      const k = d.node_key;
+      setWorkerInsights((prev) => {
+        const cur = prev[k] ?? { text: "", phase: "idle" };
+        return {
+          ...prev,
+          [k]: {
+            ...cur,
+            phase: d.phase,
+            bountyId: d.bounty_id ?? cur.bountyId,
+          },
+        };
+      });
     });
     es.addEventListener("bounty_resolving", (e) => {
       const { bounty_id } = JSON.parse(e.data);
@@ -603,6 +680,9 @@ export default function Home() {
         workers={connectedWorkers}
         agentStates={nodes}
         meshPackets={meshPackets}
+        selectedWorkerKey={selectedInsightWorker}
+        onWorkerSelect={setSelectedInsightWorker}
+        insight={panelInsight}
       />
 
       {/* Layer z-10: Header */}

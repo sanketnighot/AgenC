@@ -12,7 +12,49 @@ from typing import Any
 
 from openai import OpenAI
 
+from config import ARBITER_HEURISTIC_COLLAB
+
 logger = logging.getLogger(__name__)
+
+# Multi-domain cues for heuristic collaboration when LLM output is unusable.
+_DATA_LEX = (
+    "analyze",
+    "analysis",
+    "data",
+    "dataset",
+    "metric",
+    "statistics",
+    "statistical",
+    "volatility",
+    "bitcoin",
+    "btc",
+    "price",
+    "chart",
+    "forecast",
+    "trend",
+    "quantitative",
+    "report",
+    "annualized",
+    "realized",
+    "correlation",
+    "returns",
+)
+_CREATIVE_LEX = (
+    "creative",
+    "write",
+    "writing",
+    "copy",
+    "social media",
+    "campaign",
+    "compelling",
+    "headline",
+    "brand",
+    "story",
+    "messaging",
+    "content",
+    "caption",
+    "post",
+)
 
 BRIDGE_PROVIDERS = {
     "openai": {
@@ -72,7 +114,7 @@ class ArbiterOutcome:
     winner_node_key: str                   # primary winner / lead in collaborate mode
     collaborator_node_keys: list[str] = field(default_factory=list)  # all collaborators incl. lead; empty = winner_take_all
     reason: str = ""
-    source: str = ""                       # "llm" | "fallback_fit_score" | "fallback_first_claim"
+    source: str = ""                       # "llm" | "heuristic_collab" | "fallback_fit_score" | …
 
 
 def _confidence_to_score(conf: str | None) -> float | None:
@@ -146,6 +188,113 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
     return None
 
 
+def _lane_hits(task: str, needles: tuple[str, ...]) -> int:
+    """Count keyword/phrase hits (word-boundary for single tokens; substring for phrases)."""
+    if not task:
+        return 0
+    t = task.lower()
+    n = 0
+    for needle in needles:
+        nl = needle.lower().strip()
+        if not nl:
+            continue
+        if " " in nl:
+            if nl in t:
+                n += 1
+        elif re.search(rf"(?<!\w){re.escape(nl)}(?!\w)", t):
+            n += 1
+    return n
+
+
+def match_winner_node_key(
+    raw: Any,
+    valid_node_keys: set[str],
+    claims: list[dict[str, Any]],
+) -> str | None:
+    """Map model output to a valid node_key (exact keys, worker N, specialty label, peer prefix)."""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    if s in valid_node_keys:
+        return s
+    by_lower = {k.lower(): k for k in valid_node_keys}
+    if s.lower() in by_lower:
+        return by_lower[s.lower()]
+
+    m = re.match(r"^worker\s*[_\-]?\s*(\d+)$", s, re.I)
+    if m:
+        cand = f"worker_{m.group(1)}"
+        if cand in valid_node_keys:
+            return cand
+
+    if s.isdigit():
+        cand = f"worker_{s}"
+        if cand in valid_node_keys:
+            return cand
+
+    sl = re.sub(r"\s+", " ", s.lower().strip())
+    for c in claims:
+        nk = c.get("node_key")
+        if nk not in valid_node_keys:
+            continue
+        spec = (c.get("specialty") or "").strip()
+        if not spec:
+            continue
+        sl_spec = spec.lower()
+        if sl_spec == sl:
+            return nk
+
+    hx = re.sub(r"\s+", "", s)
+    if len(hx) >= 6 and len(hx) <= 16 and re.fullmatch(r"[0-9a-fA-F]+", hx):
+        hx_l = hx.lower()
+        for c in claims:
+            fp = (c.get("from_peer") or "").strip()
+            nk = c.get("node_key")
+            if nk not in valid_node_keys or len(fp) < 8:
+                continue
+            if fp[:8].lower() == hx_l[:8]:
+                return nk
+    return None
+
+
+def heuristic_collaboration_outcome(
+    task: str,
+    claims: list[dict[str, Any]],
+    valid_node_keys: set[str],
+) -> ArbiterOutcome | None:
+    """If LLM output failed: infer collaborate when task spans data + creative lanes and ≥2 specialties."""
+    if len(valid_node_keys) < 2:
+        return None
+    specs: set[str] = set()
+    for c in claims:
+        nk = c.get("node_key")
+        if nk not in valid_node_keys:
+            continue
+        sp = (c.get("specialty") or "").strip().lower()
+        if sp:
+            specs.add(sp)
+    if len(specs) < 2:
+        return None
+
+    if _lane_hits(task, _DATA_LEX) < 1 or _lane_hits(task, _CREATIVE_LEX) < 1:
+        return None
+
+    lead_outcome = fallback_winner(claims, valid_node_keys)
+    collabs = sorted(valid_node_keys)
+    return ArbiterOutcome(
+        mode="collaborate",
+        winner_node_key=lead_outcome.winner_node_key,
+        collaborator_node_keys=collabs,
+        reason=(
+            "heuristic: task spans analysis/data and creative signals with distinct "
+            "specialist claimants"
+        ),
+        source="heuristic_collab",
+    )
+
+
 def select_winner_llm(
     task: str,
     reward: str,
@@ -184,11 +333,12 @@ def select_winner_llm(
         "You are a neutral routing arbiter for agent bounties. "
         "Given a task and competing CLAIM entries, decide whether one agent should handle "
         "it alone (winner_take_all) or all specialists should collaborate (collaborate). "
-        "Pick a winner_node_key from the provided list — this is the sole winner for "
-        "winner_take_all, or the lead collaborator for collaborate mode. "
-        "Respond with valid JSON only, no markdown: "
-        '{"mode":"winner_take_all","winner_node_key":"<key>","reason":"<one sentence>"}' +
-        collab_instruction
+        "winner_node_key MUST be copied EXACTLY from allowed_node_keys (e.g. worker_1) — "
+        "never invent IDs. For collaborate mode, winner_node_key is the lead collaborator. "
+        "Return ONE JSON object only, no markdown or commentary. Examples:\n"
+        '{"mode":"winner_take_all","winner_node_key":"worker_1","reason":"..."}\n'
+        '{"mode":"collaborate","winner_node_key":"worker_1","reason":"..."}'
+        + collab_instruction
     )
     user = json.dumps(
         {
@@ -245,9 +395,10 @@ def select_winner_llm(
         logger.warning("Arbiter returned unparseable content")
         return None
 
-    wk = data.get("winner_node_key")
-    if not isinstance(wk, str) or wk not in valid_node_keys:
-        logger.warning("Arbiter returned invalid winner_node_key %r", wk)
+    raw_wk = data.get("winner_node_key")
+    wk = match_winner_node_key(raw_wk, valid_node_keys, claims)
+    if not wk:
+        logger.warning("Arbiter returned unusable winner_node_key %r", raw_wk)
         return None
 
     mode = data.get("mode", "winner_take_all")
@@ -258,7 +409,7 @@ def select_winner_llm(
     if not isinstance(reason, str):
         reason = "selected by bridge arbiter"
 
-    collaborator_node_keys = list(valid_node_keys) if mode == "collaborate" else []
+    collaborator_node_keys = sorted(valid_node_keys) if mode == "collaborate" else []
 
     return ArbiterOutcome(
         mode=mode,
@@ -294,5 +445,10 @@ def resolve_winner(
     llm = select_winner_llm(task, reward, claims, valid)
     if llm:
         return llm
+
+    if ARBITER_HEURISTIC_COLLAB:
+        heur = heuristic_collaboration_outcome(task, claims, valid)
+        if heur:
+            return heur
 
     return fallback_winner(claims, valid)

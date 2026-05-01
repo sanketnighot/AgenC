@@ -13,6 +13,12 @@ from typing import Optional
 import requests
 from openai import OpenAI
 
+from worker_telemetry import (
+    emit_mock_stream_chunks,
+    new_stream_id,
+    stream_completion_text,
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -139,27 +145,39 @@ def _parse_claim_json(text: str) -> dict:
     return {}
 
 
-def evaluate_claim(task: str) -> dict:
+def evaluate_claim(task: str, bounty_id: str | None = None) -> dict:
     """Returns should_claim, fit_score (0–1), claim_rationale for the bridge arbiter."""
+    sid = new_stream_id()
     if MOCK_MODE:
-        return {
-            "should_claim": True,
-            "fit_score": 0.82,
-            "claim_rationale": "MOCK: quantitative analysis fit.",
-        }
+        raw = (
+            '{"should_claim": true, "fit_score": 0.82, '
+            '"claim_rationale": "MOCK: quantitative analysis fit."}'
+        )
+        emit_mock_stream_chunks(
+            raw,
+            node_key=OWN_NODE_KEY,
+            phase="evaluate_claim",
+            bounty_id=bounty_id,
+            stream_id=sid,
+        )
+        return _parse_claim_json(raw)
     try:
-        resp = client.chat.completions.create(
-            model=MODEL,
-            messages=[
+        raw = stream_completion_text(
+            client,
+            MODEL,
+            [
                 {
                     "role": "user",
                     "content": f"{_CLAIM_JSON_INSTRUCTION_DA}\n\nTask:\n{task}",
                 },
             ],
+            node_key=OWN_NODE_KEY,
+            phase="evaluate_claim",
+            bounty_id=bounty_id,
+            stream_id=sid,
             max_tokens=180,
             timeout=28.0,
         )
-        raw = resp.choices[0].message.content or ""
         data = _parse_claim_json(raw)
         sc = bool(data.get("should_claim", False))
         try:
@@ -174,26 +192,40 @@ def evaluate_claim(task: str) -> dict:
         return {"should_claim": False, "fit_score": 0.0, "claim_rationale": ""}
 
 
-def process_task_with_prompt(task: str, system_prompt: str) -> str:
+def process_task_with_prompt(
+    task: str, system_prompt: str, bounty_id: str | None = None
+) -> str:
+    sid = new_stream_id()
     if MOCK_MODE:
-        return MOCK_RESULT
-    try:
-        resp = client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Execute this bounty: {task}"},
-            ],
-            max_tokens=150,
-            timeout=60.0,
+        emit_mock_stream_chunks(
+            MOCK_RESULT,
+            node_key=OWN_NODE_KEY,
+            phase="execute",
+            bounty_id=bounty_id,
+            stream_id=sid,
         )
-        return resp.choices[0].message.content or ""
-    except Exception as e:
-        return f"AI Execution Error: {e}"
+        return MOCK_RESULT
+    text = stream_completion_text(
+        client,
+        MODEL,
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Execute this bounty: {task}"},
+        ],
+        node_key=OWN_NODE_KEY,
+        phase="execute",
+        bounty_id=bounty_id,
+        stream_id=sid,
+        max_tokens=150,
+        timeout=60.0,
+    )
+    if not text.strip():
+        return "AI Execution Error: empty response"
+    return text
 
 
-def process_task(task: str) -> str:
-    return process_task_with_prompt(task, SYSTEM_PROMPT)
+def process_task(task: str, bounty_id: str | None = None) -> str:
+    return process_task_with_prompt(task, SYSTEM_PROMPT, bounty_id=bounty_id)
 
 
 def merge_results(
@@ -202,32 +234,43 @@ def merge_results(
     my_specialty: str,
     peer_results: list[str],
     peer_specialties: list[str],
+    bounty_id: str | None = None,
 ) -> str:
     """Merge my result with N peer results into one coherent response."""
+    sid = new_stream_id()
     if MOCK_MODE:
-        return " | ".join([my_result] + peer_results)
+        out = " | ".join([my_result] + peer_results)
+        emit_mock_stream_chunks(
+            out,
+            node_key=OWN_NODE_KEY,
+            phase="merge",
+            bounty_id=bounty_id,
+            stream_id=sid,
+        )
+        return out
     perspectives = f"{my_specialty} perspective:\n{my_result}"
     for result, spec in zip(peer_results, peer_specialties):
         perspectives += f"\n\n{spec} perspective:\n{result}"
-    try:
-        resp = client.chat.completions.create(
-            model=MODEL,
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"Task: {task}\n\n"
-                    f"{perspectives}\n\n"
-                    "Synthesize all specialist views into one coherent, complete response. "
-                    "Keep it under 6 sentences."
-                ),
-            }],
-            max_tokens=300,
-            timeout=60.0,
-        )
-        return resp.choices[0].message.content or my_result
-    except Exception as e:
-        logger.warning("merge_results error: %s", e)
-        return "\n\n".join([my_result] + peer_results)
+    user_msg = (
+        f"Task: {task}\n\n"
+        f"{perspectives}\n\n"
+        "Synthesize all specialist views into one coherent, complete response. "
+        "Keep it under 6 sentences."
+    )
+    text = stream_completion_text(
+        client,
+        MODEL,
+        [{"role": "user", "content": user_msg}],
+        node_key=OWN_NODE_KEY,
+        phase="merge",
+        bounty_id=bounty_id,
+        stream_id=sid,
+        max_tokens=300,
+        timeout=60.0,
+    )
+    if text.strip():
+        return text
+    return "\n\n".join([my_result] + peer_results)
 
 
 # ── Message router ────────────────────────────────────────────────────────────
@@ -322,7 +365,10 @@ async def handle_collaboration(payload: dict, fallback_emitter_peer_id: str) -> 
 
     try:
         my_result = await asyncio.wait_for(
-            loop.run_in_executor(None, process_task_with_prompt, task, collab_prompt),
+            loop.run_in_executor(
+                None,
+                lambda: process_task_with_prompt(task, collab_prompt, bounty_id),
+            ),
             timeout=90.0,
         )
     except asyncio.TimeoutError:
@@ -351,8 +397,15 @@ async def handle_collaboration(payload: dict, fallback_emitter_peer_id: str) -> 
             try:
                 final = await asyncio.wait_for(
                     loop.run_in_executor(
-                        None, merge_results, task, my_result, SPECIALTY,
-                        peer_results, peer_specialties_received,
+                        None,
+                        lambda: merge_results(
+                            task,
+                            my_result,
+                            SPECIALTY,
+                            peer_results,
+                            peer_specialties_received,
+                            bounty_id,
+                        ),
                     ),
                     timeout=90.0,
                 )
@@ -417,7 +470,7 @@ async def handle_new_bounty(from_peer: str, payload: dict) -> None:
 
         try:
             ev = await asyncio.wait_for(
-                loop.run_in_executor(None, evaluate_claim, task),
+                loop.run_in_executor(None, evaluate_claim, task, bounty_id),
                 timeout=35.0,
             )
         except asyncio.TimeoutError:
@@ -459,7 +512,7 @@ async def handle_new_bounty(from_peer: str, payload: dict) -> None:
             logger.info("[award]  #%s awarded! Executing…", bounty_id)
             try:
                 result = await asyncio.wait_for(
-                    loop.run_in_executor(None, process_task, task),
+                    loop.run_in_executor(None, process_task, task, bounty_id),
                     timeout=90.0,
                 )
             except asyncio.TimeoutError:
