@@ -98,6 +98,43 @@ def _axl_recv() -> tuple[str | None, dict | None]:
     return None, None
 
 
+def build_mesh_state() -> dict:
+    """Merge configured workers with emitter GET /topology for live mesh links."""
+    try:
+        res = requests.get(f"{EMITTER_API}/topology", timeout=3)
+        if res.status_code != 200:
+            raise RuntimeError("topology unavailable")
+        topo = res.json()
+    except Exception:
+        topo = {}
+
+    peer_map = {
+        p.get("public_key", "").strip().lower(): p
+        for p in topo.get("peers", [])
+        if p.get("public_key")
+    }
+    workers: list[dict] = []
+    for nk in sorted(WORKER_NODES.keys()):
+        w = WORKER_NODES[nk]
+        pid = w["peer_id"]
+        match = peer_map.get(pid)
+        up = bool(match and match.get("up"))
+        workers.append(
+            {
+                "node_key": nk,
+                "label": node_states[nk]["label"],
+                "specialty": w["specialty"],
+                "peer_id": pid,
+                "short_id": pid[:8],
+                "mesh_connected": up,
+            }
+        )
+    return {
+        "emitter_public_key": topo.get("our_public_key", ""),
+        "workers": workers,
+    }
+
+
 # ── Background tasks ──────────────────────────────────────────────────────────
 async def recv_loop() -> None:
     loop = asyncio.get_event_loop()
@@ -121,6 +158,25 @@ async def timeout_watcher() -> None:
                 await broadcast("node_status", {"node_id": "emitter", "status": "idle"})
                 await broadcast("bounty_unclaimed", {"bounty_id": bounty_id})
         await asyncio.sleep(1)
+
+
+_last_mesh_json: str = ""
+
+
+async def topology_poll_loop() -> None:
+    """Poll emitter /topology and push mesh_state when peers change."""
+    global _last_mesh_json
+    loop = asyncio.get_event_loop()
+    while True:
+        try:
+            state = await loop.run_in_executor(None, build_mesh_state)
+            dumped = json.dumps(state, sort_keys=True)
+            if dumped != _last_mesh_json:
+                _last_mesh_json = dumped
+                await broadcast("mesh_state", state)
+        except Exception:
+            pass
+        await asyncio.sleep(2)
 
 
 async def handle_inbound(from_peer: str, payload: dict) -> None:
@@ -218,8 +274,11 @@ async def handle_inbound(from_peer: str, payload: dict) -> None:
 # ── Startup ───────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def start_background_tasks() -> None:
+    global _last_mesh_json
+    _last_mesh_json = json.dumps(build_mesh_state(), sort_keys=True)
     asyncio.create_task(recv_loop())
     asyncio.create_task(timeout_watcher())
+    asyncio.create_task(topology_poll_loop())
 
 
 # ── SSE endpoint ──────────────────────────────────────────────────────────────
@@ -232,6 +291,7 @@ async def events(request: Request) -> StreamingResponse:
         try:
             # Send initial node state snapshot so the client syncs on connect
             yield f"event: node_snapshot\ndata: {json.dumps(node_states)}\n\n"
+            yield f"event: mesh_state\ndata: {json.dumps(build_mesh_state())}\n\n"
             while True:
                 if await request.is_disconnected():
                     break

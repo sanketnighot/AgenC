@@ -1,26 +1,64 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #080809;
+  --foreground: #f4f4f5;
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+  --font-sans: var(--font-dm), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains), ui-monospace, monospace;
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-dm), ui-sans-serif, system-ui, sans-serif;
+}
+
+.font-display {
+  font-family: var(--font-syne), ui-sans-serif, sans-serif;
+}
+
+/* Mesh packet travel (600ms); dots use translate(-50%, -50%) for centered anchor */
+@keyframes packet-ltr {
+  from {
+    left: 0%;
+    transform: translate(-50%, -50%);
+  }
+  to {
+    left: 100%;
+    transform: translate(-50%, -50%);
+  }
+}
+
+@keyframes packet-rtl {
+  from {
+    left: 100%;
+    transform: translate(-50%, -50%);
+  }
+  to {
+    left: 0%;
+    transform: translate(-50%, -50%);
+  }
+}
+
+.animate-packet-ltr {
+  animation: packet-ltr 600ms linear forwards;
+}
+
+.animate-packet-rtl {
+  animation: packet-rtl 600ms linear forwards;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-packet-ltr,
+  .animate-packet-rtl {
+    animation: none !important;
+    left: 50% !important;
+    opacity: 0.9;
+    transform: translate(-50%, -50%) !important;
+  }
 }
