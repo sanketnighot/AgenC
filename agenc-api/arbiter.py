@@ -6,7 +6,8 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Any
 
 from openai import OpenAI
@@ -67,9 +68,11 @@ def _bridge_client() -> tuple[OpenAI, str]:
 
 @dataclass
 class ArbiterOutcome:
-    winner_node_key: str
-    reason: str
-    source: str  # "llm" | "fallback_fit_score" | "fallback_first_claim"
+    mode: str                              # "winner_take_all" | "collaborate"
+    winner_node_key: str                   # primary winner / lead in collaborate mode
+    collaborator_node_keys: list[str] = field(default_factory=list)  # all collaborators incl. lead; empty = winner_take_all
+    reason: str = ""
+    source: str = ""                       # "llm" | "fallback_fit_score" | "fallback_first_claim"
 
 
 def _confidence_to_score(conf: str | None) -> float | None:
@@ -120,7 +123,9 @@ def fallback_winner(
     w = ranked[0]
     nk = w.get("node_key") or ""
     return ArbiterOutcome(
+        mode="winner_take_all",
         winner_node_key=nk,
+        collaborator_node_keys=[],
         reason="fallback: highest fit_score among claimants",
         source="fallback_fit_score",
     )
@@ -166,11 +171,24 @@ def select_winner_llm(
             }
         )
 
+    multiple_claimants = len(valid_node_keys) > 1
+    collab_instruction = (
+        " If multiple specialists have claimed and the task would genuinely benefit "
+        "from both specialties working together, set mode to 'collaborate' and pick "
+        "the best lead. If the task clearly fits only one specialty, use 'winner_take_all'."
+        if multiple_claimants
+        else " With only one claimant, always use 'winner_take_all'."
+    )
+
     system = (
         "You are a neutral routing arbiter for agent bounties. "
-        "Given a task and competing CLAIM entries, pick exactly one winner_node_key "
-        "from the provided node_key list only. Respond with valid JSON only, no markdown: "
-        '{"winner_node_key":"<one of the listed keys>","reason":"<one short sentence>","confidence":0.0}'
+        "Given a task and competing CLAIM entries, decide whether one agent should handle "
+        "it alone (winner_take_all) or all specialists should collaborate (collaborate). "
+        "Pick a winner_node_key from the provided list — this is the sole winner for "
+        "winner_take_all, or the lead collaborator for collaborate mode. "
+        "Respond with valid JSON only, no markdown: "
+        '{"mode":"winner_take_all","winner_node_key":"<key>","reason":"<one sentence>"}' +
+        collab_instruction
     )
     user = json.dumps(
         {
@@ -182,25 +200,45 @@ def select_winner_llm(
         ensure_ascii=False,
     )
 
-    try:
-        kwargs: dict[str, Any] = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "max_tokens": 200,
-            "temperature": 0.2,
-            "timeout": 45.0,
-        }
-        provider = os.environ.get("BRIDGE_LLM_PROVIDER", "openai").strip().lower()
-        if provider == "openai":
-            kwargs["response_format"] = {"type": "json_object"}
-        resp = client.chat.completions.create(**kwargs)
-        content = (resp.choices[0].message.content or "").strip()
-    except Exception as e:
-        logger.warning("Arbiter LLM call failed: %s", e)
-        return None
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "max_tokens": 200,
+        "temperature": 0.2,
+        "timeout": 45.0,
+    }
+    provider = os.environ.get("BRIDGE_LLM_PROVIDER", "openai").strip().lower()
+    if provider == "openai":
+        kwargs["response_format"] = {"type": "json_object"}
+
+    content = ""
+    for attempt in range(4):
+        try:
+            resp = client.chat.completions.create(**kwargs)
+            content = (resp.choices[0].message.content or "").strip()
+            break
+        except Exception as e:
+            msg_l = str(e).lower()
+            retryable = (
+                "429" in msg_l
+                or "rate" in msg_l
+                or "resource exhausted" in msg_l
+                or "503" in msg_l
+                or "overloaded" in msg_l
+            )
+            if not retryable or attempt == 3:
+                logger.warning("Arbiter LLM call failed: %s", e)
+                return None
+            delay = min(10.0, 1.5 * (2**attempt))
+            logger.warning(
+                "Arbiter LLM transient error (attempt %s); retry in %.1fs",
+                attempt + 1,
+                delay,
+            )
+            time.sleep(delay)
 
     data = _extract_json_object(content)
     if not data:
@@ -212,11 +250,20 @@ def select_winner_llm(
         logger.warning("Arbiter returned invalid winner_node_key %r", wk)
         return None
 
+    mode = data.get("mode", "winner_take_all")
+    if mode not in ("winner_take_all", "collaborate"):
+        mode = "winner_take_all"
+
     reason = data.get("reason")
     if not isinstance(reason, str):
         reason = "selected by bridge arbiter"
+
+    collaborator_node_keys = list(valid_node_keys) if mode == "collaborate" else []
+
     return ArbiterOutcome(
+        mode=mode,
         winner_node_key=wk,
+        collaborator_node_keys=collaborator_node_keys,
         reason=reason[:500],
         source="llm",
     )
@@ -237,7 +284,9 @@ def resolve_winner(
     if len(valid) == 1 and skip_llm_when_unanimous:
         nk = next(iter(valid))
         return ArbiterOutcome(
+            mode="winner_take_all",
             winner_node_key=nk,
+            collaborator_node_keys=[],
             reason="single claimant (arbiter skipped)",
             source="fallback_fit_score",
         )

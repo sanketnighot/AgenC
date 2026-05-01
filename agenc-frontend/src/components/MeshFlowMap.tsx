@@ -7,7 +7,6 @@ import {
   Background,
   Controls,
   Handle,
-  MiniMap,
   Position,
   ReactFlow,
   ReactFlowProvider,
@@ -50,9 +49,11 @@ type WorkerFlowData = {
 type WorkerRFNode = Node<WorkerFlowData, "worker">;
 
 const EMITTER_ID = "emitter";
-const CX = 400;
-const CY = 300;
-const SPOKE_R = 230;
+/** Horizontal layout: emitter top-center, workers in a row below (stays above broadcast panel). */
+const EMITTER_CENTER_X = 420;
+const EMITTER_TOP_Y = 72;
+const WORKER_ROW_Y = 252;
+const WORKER_GAP = 300;
 
 const STATUS_RING: Record<
   NodeStatus,
@@ -199,25 +200,32 @@ function buildNodes(
   const n = workers.length;
   const ew = 128;
   const eh = 128;
+  const emCx = EMITTER_CENTER_X;
+  const emCy = EMITTER_TOP_Y + eh / 2;
 
   const list: Node[] = [
     {
       id: EMITTER_ID,
       type: "emitter",
-      position: { x: CX - ew / 2, y: CY - eh / 2 },
+      position: { x: EMITTER_CENTER_X - ew / 2, y: EMITTER_TOP_Y },
       data: { label: emitterLabel, workerCount: n },
-      draggable: false,
+      draggable: true,
     },
   ];
 
+  const nw = 128;
+  const nh = 148;
+
   workers.forEach((w, i) => {
-    const angle = (-Math.PI / 2) + (2 * Math.PI * i) / Math.max(n, 1);
-    const nw = 128;
-    const nh = 148;
-    const cx = CX + SPOKE_R * Math.cos(angle);
-    const cy = CY + SPOKE_R * Math.sin(angle);
+    const cxCenter =
+      EMITTER_CENTER_X + (i - (n - 1) / 2) * WORKER_GAP;
+    const left = cxCenter - nw / 2;
+    const wx = cxCenter;
+    const wy = WORKER_ROW_Y + nh / 2;
+    const angle = Math.atan2(emCy - wy, emCx - wx);
     const agent =
-      agentStates[w.node_key] ?? ({
+      agentStates[w.node_key] ??
+      ({
         status: "idle" as const,
         label: w.label,
         specialty: w.specialty,
@@ -226,36 +234,55 @@ function buildNodes(
     list.push({
       id: w.node_key,
       type: "worker",
-      position: { x: cx - nw / 2, y: cy - nh / 2 },
+      position: { x: left, y: WORKER_ROW_Y },
       data: {
         worker: w,
         agent,
         angleRad: angle,
         glyphIndex: i,
       },
-      draggable: false,
+      draggable: true,
     });
   });
 
   return list;
 }
 
+const TONE_COLOR: Record<string, string> = {
+  amber:        "#fbbf24",
+  emerald:      "#34d399",
+  emeraldBright:"#6ee7b7",
+  emeraldDim:   "#065f46",
+  red:          "#f87171",
+  violet:       "#a78bfa",
+};
+
 function buildEdges(workers: MeshWorkerView[], meshPackets: MeshPacket[]): Edge[] {
-  const active = new Set(meshPackets.map((p) => p.spokeIndex));
-  return workers.map((w, i) => ({
-    id: `e-${w.node_key}`,
-    source: EMITTER_ID,
-    sourceHandle: `out-${i}`,
-    target: w.node_key,
-    targetHandle: "in",
-    type: "smoothstep",
-    animated: true,
-    style: {
-      stroke: active.has(i) ? "#34d399" : "#3f3f46",
-      strokeWidth: active.has(i) ? 2.75 : 1.35,
-    },
-    className: active.has(i) ? "mesh-edge-active drop-shadow-[0_0_8px_rgba(52,211,153,0.45)]" : "",
-  }));
+  // Map spoke index → tone so each edge can carry its own color
+  const activeMap = new Map<number, string>();
+  meshPackets.forEach((p) => activeMap.set(p.spokeIndex, p.tone));
+
+  return workers.map((w, i) => {
+    const tone = activeMap.get(i);
+    const color = tone ? (TONE_COLOR[tone] ?? "#34d399") : "#3f3f46";
+    const isActive = Boolean(tone);
+    return {
+      id: `e-${w.node_key}`,
+      source: EMITTER_ID,
+      sourceHandle: `out-${i}`,
+      target: w.node_key,
+      targetHandle: "in",
+      type: "smoothstep",
+      animated: true,
+      style: {
+        stroke: color,
+        strokeWidth: isActive ? 2.75 : 1.35,
+      },
+      className: isActive
+        ? `mesh-edge-active drop-shadow-[0_0_8px_${color}66]`
+        : "",
+    };
+  });
 }
 
 function FlowInner({
@@ -283,9 +310,18 @@ function FlowInner({
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
 
+  const workerIdsKey = workers.map((w) => w.node_key).join("|");
+
   useEffect(() => {
-    setNodes(buildNodes(emitterLabel, workers, agentStates));
-  }, [emitterLabel, workers, agentStates, setNodes]);
+    setNodes((curr) => {
+      const built = buildNodes(emitterLabel, workers, agentStates);
+      const posById = new Map(curr.map((node) => [node.id, node.position]));
+      return built.map((node) => ({
+        ...node,
+        position: posById.get(node.id) ?? node.position,
+      }));
+    });
+  }, [emitterLabel, workerIdsKey, workers, agentStates, setNodes]);
 
   useEffect(() => {
     setEdges(buildEdges(workers, meshPackets));
@@ -293,36 +329,26 @@ function FlowInner({
 
   useEffect(() => {
     const t = requestAnimationFrame(() => {
-      fitView({ padding: 0.22, duration: 280, maxZoom: 1.2 });
+      fitView({ padding: 0.28, duration: 280, maxZoom: 1.15 });
     });
     return () => cancelAnimationFrame(t);
-  }, [workers.length, fitView]);
+  }, [workerIdsKey, fitView]);
 
   const onInit = useCallback(() => {
-    fitView({ padding: 0.22, maxZoom: 1.2 });
+    fitView({ padding: 0.28, maxZoom: 1.15 });
   }, [fitView]);
 
   const n = workers.length;
 
   return (
-    <div className="relative flex min-h-[min(52vh,480px)] w-full flex-col rounded-2xl border border-zinc-800/50 bg-[#060607] shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
-      <div className="absolute inset-0 rounded-2xl opacity-[0.4] [background-image:radial-gradient(ellipse_at_50%_35%,rgba(16,185,129,0.06),transparent_60%),repeating-linear-gradient(-18deg,transparent,transparent_31px,rgba(63,63,70,0.05)_31px,rgba(63,63,70,0.05)_32px)]" />
+    <div className="fixed inset-0 z-0 bg-[#060607]">
+      <div className="absolute inset-0 opacity-[0.4] bg-[radial-gradient(ellipse_at_50%_35%,rgba(16,185,129,0.06),transparent_60%),repeating-linear-gradient(-18deg,transparent,transparent_31px,rgba(63,63,70,0.05)_31px,rgba(63,63,70,0.05)_32px)]" />
 
-      <div className="relative z-10 flex items-center justify-between px-4 pt-4">
-        <span className="text-[10px] font-medium uppercase tracking-[0.22em] text-zinc-600">
-          Mesh map
-        </span>
-        <span className="font-mono text-[10px] text-zinc-500">
-          {n} connected peer{n === 1 ? "" : "s"}
-        </span>
-      </div>
-
-      <div className="relative z-10 h-[min(52vh,440px)] w-full">
+      <div className="absolute inset-0">
         {n === 0 ? (
           <div className="flex h-full items-center justify-center px-6">
             <p className="max-w-[280px] text-center text-xs leading-relaxed text-zinc-600">
-              No peers connected. Start worker nodes — they appear here with live
-              edges.
+              No peers connected. Start worker nodes — they appear here with live edges.
             </p>
           </div>
         ) : (
@@ -337,17 +363,15 @@ function FlowInner({
             colorMode="dark"
             minZoom={0.35}
             maxZoom={1.35}
-            nodesDraggable={false}
+            nodesDraggable
             nodesConnectable={false}
-            elementsSelectable={false}
+            elementsSelectable
             panOnScroll
             zoomOnScroll
             zoomOnPinch
             panOnDrag
-            defaultEdgeOptions={{
-              type: "smoothstep",
-            }}
-            className="!bg-transparent [&_.react-flow__edge-path]:!stroke-linecap-round"
+            defaultEdgeOptions={{ type: "smoothstep" }}
+            className="!bg-transparent [&_.react-flow__edge-path]:!stroke-linecap-round [&_.react-flow__attribution]:hidden!"
           >
             <Background
               id="mesh-bg"
@@ -359,14 +383,6 @@ function FlowInner({
             <Controls
               className="!m-2 !overflow-hidden !rounded-xl !border !border-zinc-800/80 !bg-zinc-950/95 !shadow-xl [&_button]:!h-7 [&_button]:!w-7 [&_button]:!rounded-lg [&_button]:!border-zinc-800 [&_button]:!bg-zinc-900 [&_button]:!fill-zinc-400 [&_button:hover]:!bg-zinc-800"
               showInteractive={false}
-            />
-            <MiniMap
-              className="!m-2 !overflow-hidden !rounded-xl !border !border-zinc-800/80 !bg-zinc-950/90 [&_.react-flow__minimap-mask]:fill-black/45 [&_.react-flow__minimap-node]:!rounded-md"
-              zoomable
-              pannable
-              nodeColor={(node) =>
-                node.type === "emitter" ? "#10b981" : "#52525b"
-              }
             />
           </ReactFlow>
         )}

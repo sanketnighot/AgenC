@@ -16,6 +16,7 @@ from config import (
     ARBITER_SKIP_WHEN_UNANIMOUS,
     BOUNTY_PENDING_MAX_SEC,
     CLAIM_WINDOW_SEC,
+    COLLAB_TIMEOUT_SEC,
     NO_CLAIM_AFTER_BROADCAST_SEC,
 )
 
@@ -49,10 +50,13 @@ WORKER_NODES = {
 # ── In-memory state ───────────────────────────────────────────────────────────
 bounties: dict = {}
 
+# Initialise node_states dynamically from WORKER_NODES so N workers work without hardcoding
 node_states: dict = {
     "emitter": {"status": "idle", "label": "Emitter"},
-    "worker_1": {"status": "idle", "label": "Worker 1", "specialty": "Data Analyst"},
-    "worker_2": {"status": "idle", "label": "Worker 2", "specialty": "Creative Strategist"},
+    **{
+        nk: {"status": "idle", "label": f"Worker {i + 1}", "specialty": wv["specialty"]}
+        for i, (nk, wv) in enumerate(WORKER_NODES.items())
+    },
 }
 
 for _w in WORKER_NODES.values():
@@ -84,7 +88,7 @@ sse_clients: list[asyncio.Queue] = []
 
 async def broadcast(event: str, data: dict) -> None:
     msg = f"event: {event}\ndata: {json.dumps(data)}\n\n"
-    for q in sse_clients:
+    for q in list(sse_clients):  # copy to avoid race on concurrent disconnect
         await q.put(msg)
 
 
@@ -163,21 +167,27 @@ def build_mesh_state() -> dict:
 
 
 async def recv_loop() -> None:
+    """Drain ALL buffered AXL messages every poll cycle instead of one-per-tick."""
     loop = asyncio.get_event_loop()
     while True:
         try:
-            from_peer, payload = await loop.run_in_executor(None, _axl_recv)
-            if payload:
+            while True:
+                from_peer, payload = await loop.run_in_executor(None, _axl_recv)
+                if not payload:
+                    break
                 await handle_inbound(from_peer, payload)
-        except Exception:
-            pass
-        await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.warning("recv_loop error: %s", e)
+        await asyncio.sleep(0.3)
 
 
 async def _force_unclaimed(bounty_id: str) -> None:
     async with _lock(bounty_id):
         b = bounties.get(bounty_id)
         if not b or b["status"] != "PENDING":
+            return
+        # Don't race with resolve_bounty mid-arbitration
+        if b.get("claim_phase") == "resolving":
             return
         b["status"] = "UNCLAIMED"
         b["claim_phase"] = None
@@ -186,22 +196,48 @@ async def _force_unclaimed(bounty_id: str) -> None:
     await broadcast("bounty_unclaimed", {"bounty_id": bounty_id})
 
 
+async def _force_collab_timeout(bounty_id: str) -> None:
+    """Force a stalled COLLABORATING bounty to UNCLAIMED and idle all nodes."""
+    async with _lock(bounty_id):
+        b = bounties.get(bounty_id)
+        if not b or b["status"] != "COLLABORATING":
+            return
+        collaborators = list(b.get("collaborators") or [])
+        b["status"] = "UNCLAIMED"
+
+    for nk in collaborators:
+        if nk in node_states:
+            node_states[nk]["status"] = "idle"
+            await broadcast("node_status", {"node_id": nk, "status": "idle"})
+    node_states["emitter"]["status"] = "idle"
+    await broadcast("node_status", {"node_id": "emitter", "status": "idle"})
+    await broadcast("bounty_unclaimed", {"bounty_id": bounty_id})
+    logger.warning("Collaboration timed out for bounty %s", bounty_id)
+
+
 async def timeout_watcher() -> None:
     while True:
         now = time.time()
         for bounty_id, b in list(bounties.items()):
-            if b.get("status") != "PENDING":
-                continue
-            age = now - b["created_at"]
-            if age > BOUNTY_PENDING_MAX_SEC:
-                await _force_unclaimed(bounty_id)
-                continue
-            if (
-                b.get("claim_phase") == "collecting"
-                and len(b.get("pending_claims") or {}) == 0
-                and age > NO_CLAIM_AFTER_BROADCAST_SEC
-            ):
-                await _force_unclaimed(bounty_id)
+            status = b.get("status")
+
+            if status == "PENDING":
+                age = now - b["created_at"]
+                if age > BOUNTY_PENDING_MAX_SEC:
+                    await _force_unclaimed(bounty_id)
+                    continue
+                if (
+                    b.get("claim_phase") == "collecting"
+                    and len(b.get("pending_claims") or {}) == 0
+                    and age > NO_CLAIM_AFTER_BROADCAST_SEC
+                ):
+                    await _force_unclaimed(bounty_id)
+
+            elif status == "COLLABORATING":
+                started = b.get("collaboration_started_at", b.get("created_at", now))
+                if now - started > COLLAB_TIMEOUT_SEC:
+                    await _force_collab_timeout(bounty_id)
+
         await asyncio.sleep(1)
 
 
@@ -289,11 +325,18 @@ async def resolve_bounty(bounty_id: str) -> None:
         {
             "bounty_id": bounty_id,
             "winner_node_key": outcome.winner_node_key,
+            "mode": outcome.mode,
             "reason": outcome.reason,
             "source": outcome.source,
         },
     )
 
+    # ── Collaboration mode ────────────────────────────────────────────────────
+    if outcome.mode == "collaborate" and len(outcome.collaborator_node_keys) > 1:
+        await _dispatch_collaboration(bounty_id, outcome, claims_list, task_t)
+        return
+
+    # ── Winner-take-all mode ──────────────────────────────────────────────────
     winner_key = outcome.winner_node_key
     if winner_key not in WORKER_NODES:
         logger.warning("Outcome winner %r not in WORKER_NODES", winner_key)
@@ -331,12 +374,12 @@ async def resolve_bounty(bounty_id: str) -> None:
         await broadcast("node_status", {"node_id": winner_key, "status": "working"})
 
     award_payload = {"type": "AWARD", "bounty_id": bounty_id, "task": task_t}
-    await loop.run_in_executor(
-        None,
-        _axl_send,
-        WORKER_NODES[winner_key]["peer_id"],
-        award_payload,
+    ok = await loop.run_in_executor(
+        None, _axl_send, WORKER_NODES[winner_key]["peer_id"], award_payload,
     )
+    if not ok:
+        logger.warning("AWARD send failed for bounty %s → worker %s", bounty_id, winner_key)
+
     await broadcast(
         "worker_awarded",
         {
@@ -365,6 +408,81 @@ async def resolve_bounty(bounty_id: str) -> None:
         await broadcast("node_status", {"node_id": wk, "status": "idle"})
 
 
+async def _dispatch_collaboration(
+    bounty_id: str,
+    outcome,
+    claims_list: list,
+    task_t: str,
+) -> None:
+    """Send COLLAB_AWARD to all N collaborators with a full peer_workers list."""
+    loop = asyncio.get_event_loop()
+    lead_key = outcome.winner_node_key
+    collab_keys = [k for k in outcome.collaborator_node_keys if k in WORKER_NODES]
+
+    mesh = await loop.run_in_executor(None, build_mesh_state)
+    emitter_peer_id = mesh.get("emitter_public_key", "")
+    lead_peer_id = WORKER_NODES[lead_key]["peer_id"]
+
+    # Build enriched worker list for SSE (with is_lead flag)
+    collab_workers_sse = []
+    for wk in collab_keys:
+        claim = next((c for c in claims_list if c.get("node_key") == wk), None)
+        specialty = (claim.get("specialty") if claim else None) or WORKER_NODES[wk]["specialty"]
+        collab_workers_sse.append({"node_key": wk, "specialty": specialty, "is_lead": wk == lead_key})
+
+    async with _lock(bounty_id):
+        bb = bounties.get(bounty_id)
+        if not bb or bb["status"] != "PENDING":
+            return
+        bb["status"] = "COLLABORATING"
+        bb["collaboration_mode"] = True
+        bb["collaborators"] = collab_keys
+        bb["collaboration_started_at"] = time.time()
+        bb["winner_id"] = lead_peer_id
+        bb["winner_specialty"] = " + ".join(w["specialty"] for w in collab_workers_sse)
+        bb["claim_phase"] = None
+
+    for wk in collab_keys:
+        if wk in node_states:
+            node_states[wk]["status"] = "working"
+            await broadcast("node_status", {"node_id": wk, "status": "working"})
+
+    await broadcast("bounty_collaborating", {"bounty_id": bounty_id, "workers": collab_workers_sse})
+
+    # Send COLLAB_AWARD to each worker with all peers except itself
+    for wk in collab_keys:
+        peer_keys = [k for k in collab_keys if k != wk]
+        peer_workers = [
+            {
+                "peer_id": WORKER_NODES[k]["peer_id"],
+                "specialty": next(
+                    (w["specialty"] for w in collab_workers_sse if w["node_key"] == k),
+                    WORKER_NODES[k]["specialty"],
+                ),
+                "node_key": k,
+            }
+            for k in peer_keys
+        ]
+        collab_award = {
+            "type": "COLLAB_AWARD",
+            "bounty_id": bounty_id,
+            "task": task_t,
+            "is_lead": wk == lead_key,
+            "lead_node_key": lead_key,
+            "lead_peer_id": lead_peer_id,
+            "peer_workers": peer_workers,
+            "emitter_peer_id": emitter_peer_id,
+        }
+        ok = await loop.run_in_executor(None, _axl_send, WORKER_NODES[wk]["peer_id"], collab_award)
+        if not ok:
+            logger.warning("COLLAB_AWARD send failed for bounty %s → worker %s", bounty_id, wk)
+
+    logger.info(
+        "Dispatched collaboration for bounty %s: lead=%s, all=%s",
+        bounty_id, lead_key, collab_keys,
+    )
+
+
 async def handle_inbound(from_peer: str, payload: dict) -> None:
     loop = asyncio.get_event_loop()
     msg_type = payload.get("type")
@@ -383,20 +501,14 @@ async def handle_inbound(from_peer: str, payload: dict) -> None:
             await loop.run_in_executor(None, _axl_send, from_peer, reject_payload)
             await broadcast(
                 "worker_rejected",
-                {
-                    "bounty_id": bounty_id,
-                    "worker_id": short_id,
-                    "specialty": specialty,
-                    "node_key": "",
-                },
+                {"bounty_id": bounty_id, "worker_id": short_id, "specialty": specialty, "node_key": ""},
             )
             return
 
         rationale = payload.get("claim_rationale") or payload.get("rationale") or ""
-        if isinstance(rationale, str):
-            rationale = rationale[:300]
-        else:
+        if not isinstance(rationale, str):
             rationale = ""
+        rationale = rationale[:300]
 
         fit_score = normalize_fit_score(payload)
 
@@ -436,12 +548,7 @@ async def handle_inbound(from_peer: str, payload: dict) -> None:
             await loop.run_in_executor(None, _axl_send, from_peer, reject_payload)
             await broadcast(
                 "worker_rejected",
-                {
-                    "bounty_id": bounty_id,
-                    "worker_id": short_id,
-                    "specialty": specialty,
-                    "node_key": node_key,
-                },
+                {"bounty_id": bounty_id, "worker_id": short_id, "specialty": specialty, "node_key": node_key},
             )
             return
 
@@ -459,20 +566,44 @@ async def handle_inbound(from_peer: str, payload: dict) -> None:
             },
         )
 
+    elif msg_type == "PEER_MSG_NOTIF":
+        await broadcast(
+            "worker_direct_message",
+            {
+                "bounty_id": bounty_id,
+                "from_node_key": payload.get("from_node_key", ""),
+                "to_node_key": payload.get("to_node_key", ""),
+                "msg_type": payload.get("msg_type", "COLLAB_SHARE"),
+            },
+        )
+
     elif msg_type == "COMPLETED_BOUNTY":
         if not bounty_id or bounty_id not in bounties:
             return
 
-        b = bounties[bounty_id]
-        b["status"] = "COMPLETED"
-        b["result"] = payload.get("result", "")
-        specialty = payload.get("specialty", b.get("winner_specialty", "Unknown"))
-        short_id = from_peer[:8]
+        result_text = payload.get("result", "")
+        collaboration = payload.get("collaboration", False)
+        collaborators_payload = payload.get("collaborators", [])
+        completing_node_key = resolve_node_key(from_peer)
 
-        node_key = resolve_node_key(from_peer)
-        if node_key:
-            node_states[node_key]["status"] = "idle"
-            await broadcast("node_status", {"node_id": node_key, "status": "idle"})
+        async with _lock(bounty_id):
+            b = bounties.get(bounty_id)
+            if not b or b["status"] in ("COMPLETED", "UNCLAIMED"):
+                return
+            b["status"] = "COMPLETED"
+            b["result"] = result_text
+            specialty = payload.get("specialty") or b.get("winner_specialty", "Unknown")
+            stored_collaborators = list(b.get("collaborators") or [])
+
+        nodes_to_idle: list[str] = (
+            stored_collaborators if (collaboration and stored_collaborators)
+            else ([completing_node_key] if completing_node_key else [])
+        )
+
+        for nk in nodes_to_idle:
+            if nk in node_states:
+                node_states[nk]["status"] = "idle"
+                await broadcast("node_status", {"node_id": nk, "status": "idle"})
 
         node_states["emitter"]["status"] = "idle"
         await broadcast("node_status", {"node_id": "emitter", "status": "idle"})
@@ -481,9 +612,12 @@ async def handle_inbound(from_peer: str, payload: dict) -> None:
             "bounty_completed",
             {
                 "bounty_id": bounty_id,
-                "result": b["result"],
+                "result": result_text,
                 "specialty": specialty,
-                "worker_id": short_id,
+                "worker_id": from_peer[:8],
+                "node_key": completing_node_key,
+                "collaboration": collaboration,
+                "collaborators": collaborators_payload,
             },
         )
 
@@ -515,7 +649,8 @@ async def events(request: Request) -> StreamingResponse:
                 except asyncio.TimeoutError:
                     yield ": heartbeat\n\n"
         finally:
-            sse_clients.remove(queue)
+            if queue in sse_clients:
+                sse_clients.remove(queue)
 
     return StreamingResponse(
         generator(),
@@ -546,6 +681,8 @@ async def broadcast_bounty(bounty: Bounty) -> dict:
         "claim_phase": "collecting",
         "pending_claims": {},
         "claim_window_end": None,
+        "collaboration_mode": False,
+        "collaborators": [],
     }
 
     node_states["emitter"]["status"] = "busy"
@@ -579,11 +716,7 @@ async def broadcast_bounty(bounty: Bounty) -> dict:
 
     await broadcast(
         "bounty_posted",
-        {
-            "bounty_id": bounty_id,
-            "task": bounty.task,
-            "reward": bounty.reward,
-        },
+        {"bounty_id": bounty_id, "task": bounty.task, "reward": bounty.reward},
     )
 
     return {"status": "broadcasted", "bounty_id": bounty_id, "sent_to": success_count}

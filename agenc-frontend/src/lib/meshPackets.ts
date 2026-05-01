@@ -7,7 +7,8 @@ export type PacketTone =
   | "emerald"
   | "emeraldBright"
   | "red"
-  | "emeraldDim";
+  | "emeraldDim"
+  | "violet";
 
 export interface MeshPacket {
   id: string;
