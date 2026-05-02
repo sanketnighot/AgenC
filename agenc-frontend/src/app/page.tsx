@@ -16,77 +16,21 @@ import { FloatingPanel, type PanelBox } from "@/components/FloatingPanel";
 import { ImageLightbox } from "@/components/ImageLightbox";
 import { BountyResultMarkdown } from "@/components/BountyResultMarkdown";
 import type { InsightPayload } from "@/components/WorkerInsightBubble";
-import type { MeshWorkerView } from "@/types/mesh";
-import {
-  resolveWorkerNodeBySpecialty,
-  routePath,
-  schedulePacketTrain,
-  type MeshNodeId,
-  type MeshPacket,
-  type PacketTone,
-} from "@/lib/meshPackets";
 import { BOUNTY_ESCROW_ABI } from "@/lib/abi";
+import { computePanelLayout } from "@/lib/panelLayout";
+import { useMeshAnimation } from "@/hooks/useMeshAnimation";
+import {
+  useBountyStream,
+  type BountyCard,
+  type BountyImage,
+  type LogEntry,
+  type NodeState,
+  type WorkerInsightBuf,
+} from "@/hooks/useBountyStream";
 
 const CONTRACT_ADDRESS = (process.env.NEXT_PUBLIC_CONTRACT_ADDRESS ?? "") as `0x${string}`;
 
-type NodeStatus =
-  | "idle"
-  | "busy"
-  | "evaluating"
-  | "claiming"
-  | "working"
-  | "rejected"
-  | "completed";
-
-interface NodeState {
-  status: NodeStatus;
-  label: string;
-  specialty?: string;
-}
-
-interface BidEntry {
-  node_key: string;
-  specialty: string;
-  outcome: "bid" | "awarded" | "rejected";
-}
-
-interface BountyImage {
-  mime: string;
-  data_base64: string;
-}
-
-interface BountyCard {
-  bounty_id: string;
-  task: string;
-  reward: string;
-  status: "PENDING" | "CLAIMED" | "EXECUTING" | "COLLABORATING" | "COMPLETED" | "UNCLAIMED";
-  winner_specialty?: string;
-  worker_id?: string;
-  result?: string;
-  images?: BountyImage[];
-  collaborating_workers?: string[];
-  collaboration?: boolean;
-  bids: BidEntry[];
-  deposit_tx?: string;
-  payment_tx?: string;
-}
-
-interface LogEntry {
-  time: string;
-  tag: string;
-  msg: string;
-}
-
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
-
-/** Pixel alignment with pre-draggable layout: `top-20`, `left-4`/`right-4`, `bottom-8`, `lg:` broadcast insets. */
-const LAYOUT_TOP = 80;
-const LAYOUT_SIDE = 16;
-const LAYOUT_BOTTOM = 32;
-const LG_BREAKPOINT = 1024;
-/** `lg:left-[calc(1rem+18rem+1rem)]` and `lg:right-[calc(1rem+20rem+1rem)]` → side rails + gutters */
-const BROADCAST_LG_LEFT = 320;
-const BROADCAST_LG_RIGHT_INSET = 352;
 
 function useViewport() {
   const [vp, setVp] = useState({ w: 1280, h: 800 });
@@ -238,7 +182,6 @@ function ActivityTimeline({ logs, logsEndRef }: {
 
 const STAMP_STYLE: Record<BountyCard["status"], string> = {
   PENDING:       "border-amber-500/40 text-amber-400/80 bg-amber-500/5",
-  CLAIMED:       "border-sky-500/40 text-sky-400/80 bg-sky-500/5",
   EXECUTING:     "border-emerald-500/40 text-emerald-400 bg-emerald-500/5",
   COLLABORATING: "border-violet-500/40 text-violet-400/80 bg-violet-500/5",
   COMPLETED:     "border-emerald-400/60 text-emerald-300 bg-emerald-500/8",
@@ -626,32 +569,6 @@ function AuctionBountyRail({
   );
 }
 
-const INSIGHT_MODEL_CAP = 24000;
-const INSIGHT_TOOL_CAP = 8000;
-
-function capInsightTail(s: string, max: number): string {
-  if (s.length <= max) return s;
-  return s.slice(-max);
-}
-
-/** Reset tool/model buffers when SSE carries a different bounty_id for this worker. */
-function shouldResetInsightForBounty(
-  prevBountyId: string | undefined,
-  incomingBountyId: string | null | undefined,
-): boolean {
-  if (incomingBountyId == null || incomingBountyId === "") return false;
-  if (prevBountyId == null || prevBountyId === "") return false;
-  return incomingBountyId !== prevBountyId;
-}
-
-interface WorkerInsightBuf {
-  toolText: string;
-  modelText: string;
-  phase: string;
-  bountyId?: string;
-  specialty?: string;
-}
-
 // ── Home ──────────────────────────────────────────────────────────────────────
 
 export default function Home() {
@@ -659,7 +576,6 @@ export default function Home() {
   const [rewardEth, setRewardEth] = useState("0.01");
   const [submitting, setSubmitting] = useState(false);
   const [expandedId, setExpandedId] = useState<string | null>(null);
-  const [repRefreshTick, setRepRefreshTick] = useState(0);
 
   // ── Wallet ────────────────────────────────────────────────────────────────
   const { address, isConnected } = useAccount();
@@ -670,27 +586,10 @@ export default function Home() {
   const publicClient = usePublicClient();
   const [pendingTxHash, setPendingTxHash] = useState<`0x${string}` | undefined>();
   const { isLoading: isTxConfirming } = useWaitForTransactionReceipt({ hash: pendingTxHash });
-  const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [bounties, setBounties] = useState<BountyCard[]>([]);
-  const [nodes, setNodes] = useState<Record<string, NodeState>>({
-    emitter: { status: "idle", label: "Emitter" },
-    worker_1: { status: "idle", label: "Worker 1", specialty: "Data Analyst" },
-    worker_2: {
-      status: "idle",
-      label: "Worker 2",
-      specialty: "Creative Strategist",
-    },
-  });
-  const [meshWorkers, setMeshWorkers] = useState<MeshWorkerView[]>([]);
-  const [meshPackets, setMeshPackets] = useState<MeshPacket[]>([]);
-  const [workerInsights, setWorkerInsights] = useState<
-    Record<string, WorkerInsightBuf>
-  >({});
   const [selectedInsightWorker, setSelectedInsightWorker] = useState<
     string | null
   >(null);
   const [telemetryEnabled, setTelemetryEnabled] = useState<boolean | null>(null);
-  const [sseConnected, setSseConnected] = useState(false);
   const [walletUiReady, setWalletUiReady] = useState(false);
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
   /** Remount `react-rnd` once real viewport is known (`default` only applies on mount). */
@@ -698,56 +597,32 @@ export default function Home() {
 
   const vp = useViewport();
 
+  const workerKeysRef = useRef<string[]>([]);
+  const { meshPackets, spawnTrain } = useMeshAnimation(workerKeysRef);
+
+  const {
+    bounties,
+    setBounties,
+    nodes,
+    logs,
+    sseConnected,
+    workerInsights,
+    connectedWorkers,
+    repRefreshTick,
+    setRepRefreshTick,
+    logsEndRef,
+  } = useBountyStream(API, spawnTrain, setExpandedId, workerKeysRef);
+
   useLayoutEffect(() => {
     setPanelMountKey(1);
   }, []);
 
-  const activityPanelBox = useMemo((): PanelBox => {
-    return {
-      x: LAYOUT_SIDE,
-      y: LAYOUT_TOP,
-      width: 288,
-      height: Math.max(240, vp.h - LAYOUT_TOP - LAYOUT_BOTTOM),
-    };
-  }, [vp.h]);
-
-  const bountyRailBox = useMemo((): PanelBox => {
-    const wRail = 320;
-    return {
-      x: vp.w - LAYOUT_SIDE - wRail,
-      y: LAYOUT_TOP,
-      width: wRail,
-      height: Math.max(240, vp.h - LAYOUT_TOP - LAYOUT_BOTTOM),
-    };
-  }, [vp.w, vp.h]);
-
-  const broadcastPanelBox = useMemo((): PanelBox => {
-    const H = 280;
-    const y = vp.h - LAYOUT_BOTTOM - H;
-    if (vp.w >= LG_BREAKPOINT) {
-      const width = vp.w - BROADCAST_LG_LEFT - BROADCAST_LG_RIGHT_INSET;
-      return {
-        x: BROADCAST_LG_LEFT,
-        y,
-        width: Math.max(280, width),
-        height: H,
-      };
-    }
-    return {
-      x: LAYOUT_SIDE,
-      y,
-      width: vp.w - 2 * LAYOUT_SIDE,
-      height: H,
-    };
-  }, [vp.w, vp.h]);
-
-  /** Resize caps: stay on-screen; side rails ≤ half viewport so center mesh stays usable */
-  const panelBounds = useMemo(() => {
-    const maxPanelW = vp.w - 2 * LAYOUT_SIDE;
-    const maxPanelH = vp.h - LAYOUT_TOP - LAYOUT_BOTTOM;
-    const sidePanelMaxW = Math.min(maxPanelW, Math.floor(vp.w * 0.5));
-    return { maxPanelW, maxPanelH, sidePanelMaxW };
-  }, [vp.w, vp.h]);
+  const {
+    activityPanelBox,
+    bountyRailBox,
+    broadcastPanelBox,
+    panelBounds,
+  } = useMemo(() => computePanelLayout(vp), [vp.w, vp.h]);
 
   useEffect(() => {
     queueMicrotask(() => setWalletUiReady(true));
@@ -766,39 +641,6 @@ export default function Home() {
   }, [selectedInsightWorker, workerInsights]);
 
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const bid = params.get("bounty");
-    if (!bid) return;
-    fetch(`${API}/api/bounties/${bid}`)
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data: Record<string, unknown> | null) => {
-        if (!data || typeof data.task !== "string") return;
-        const status =
-          typeof data.status === "string"
-            ? data.status
-            : "PENDING";
-        const card: BountyCard = {
-          bounty_id: bid,
-          task: data.task as string,
-          reward: typeof data.reward === "string" ? data.reward : "",
-          status: status as BountyCard["status"],
-          result: typeof data.result === "string" ? data.result : undefined,
-          images: Array.isArray(data.images) ? (data.images as BountyImage[]) : undefined,
-          bids: [],
-          deposit_tx:
-            typeof data.deposit_tx === "string" ? data.deposit_tx : undefined,
-          collaboration: Boolean(data.collaboration_mode),
-        };
-        setBounties((prev) => {
-          if (prev.some((b) => b.bounty_id === bid)) return prev;
-          return [card, ...prev];
-        });
-        setExpandedId(bid);
-      })
-      .catch(() => {});
-  }, []);
-
-  useEffect(() => {
     let cancelled = false;
     fetch(`${API}/api/telemetry/status`)
       .then((r) => r.json())
@@ -812,382 +654,6 @@ export default function Home() {
       cancelled = true;
     };
   }, []);
-
-  const meshWorkersRef = useRef(meshWorkers);
-  useEffect(() => {
-    meshWorkersRef.current = meshWorkers;
-  }, [meshWorkers]);
-
-  const connectedWorkers = useMemo(
-    () => meshWorkers.filter((w) => w.mesh_connected),
-    [meshWorkers],
-  );
-
-  const nodesRef = useRef(nodes);
-  useEffect(() => {
-    nodesRef.current = nodes;
-  }, [nodes]);
-
-  const workerKeysRef = useRef<string[]>([]);
-  useEffect(() => {
-    workerKeysRef.current = connectedWorkers.map((w) => w.node_key);
-  }, [connectedWorkers]);
-
-  const logsEndRef = useRef<HTMLDivElement>(null);
-
-  const spawnTrain = useCallback(
-    (from: MeshNodeId, to: MeshNodeId, tone: PacketTone) => {
-      const steps = routePath(from, to, workerKeysRef.current);
-      if (steps.length === 0) return;
-      schedulePacketTrain(
-        steps,
-        tone,
-        (p) => setMeshPackets((prev) => [...prev, p]),
-        (id) => setMeshPackets((prev) => prev.filter((x) => x.id !== id)),
-      );
-    },
-    [],
-  );
-
-  const addLog = (tag: string, msg: string) => {
-    setLogs((prev) => [
-      ...prev,
-      { time: new Date().toLocaleTimeString(), tag, msg },
-    ]);
-  };
-
-  const setNodeStatus = (node_id: string, status: NodeStatus) =>
-    setNodes((prev) => ({
-      ...prev,
-      [node_id]: { ...prev[node_id], status },
-    }));
-
-  const flashNode = useCallback((node_id: string, s: NodeStatus, ms = 2000) => {
-    setNodes((prev) => ({ ...prev, [node_id]: { ...prev[node_id], status: s } }));
-    setTimeout(() => {
-      setNodes((prev) => ({
-        ...prev,
-        [node_id]: { ...prev[node_id], status: "idle" },
-      }));
-    }, ms);
-  }, []);
-
-  useEffect(() => {
-    logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [logs]);
-
-  useEffect(() => {
-    const es = new EventSource(`${API}/api/events`);
-
-    es.onopen = () => setSseConnected(true);
-    es.onerror = () => setSseConnected(false);
-
-    es.addEventListener("mesh_state", (e) => {
-      const data = JSON.parse(e.data) as { workers?: MeshWorkerView[] };
-      if (Array.isArray(data.workers)) {
-        setMeshWorkers(data.workers);
-      }
-    });
-
-    es.addEventListener("node_snapshot", (e) => {
-      const snap = JSON.parse(e.data) as Record<string, NodeState>;
-      setNodes((prev) => {
-        const next = { ...prev };
-        for (const [id, state] of Object.entries(snap))
-          next[id] = { ...prev[id], ...state };
-        return next;
-      });
-    });
-    es.addEventListener("node_status", (e) => {
-      const { node_id, status } = JSON.parse(e.data);
-      setNodeStatus(node_id, status as NodeStatus);
-    });
-    es.addEventListener("worker_llm_delta", (e) => {
-      const d = JSON.parse(e.data) as {
-        node_key: string;
-        phase: string;
-        bounty_id?: string | null;
-        delta: string;
-        specialty?: string;
-      };
-      const k = d.node_key;
-      setWorkerInsights((prev) => {
-        const cur = prev[k] ?? {
-          toolText: "",
-          modelText: "",
-          phase: "idle",
-          specialty: d.specialty,
-        };
-        const reset = shouldResetInsightForBounty(
-          cur.bountyId,
-          d.bounty_id,
-        );
-        let toolText = reset ? "" : cur.toolText;
-        let modelText = reset ? "" : cur.modelText;
-        const bountyId = reset
-          ? (d.bounty_id ?? undefined)
-          : (d.bounty_id ?? cur.bountyId);
-        const chunk = d.delta || "";
-        if (d.phase === "tool") {
-          toolText = capInsightTail(toolText + chunk, INSIGHT_TOOL_CAP);
-        } else {
-          modelText = capInsightTail(modelText + chunk, INSIGHT_MODEL_CAP);
-        }
-        return {
-          ...prev,
-          [k]: {
-            toolText,
-            modelText,
-            phase: d.phase,
-            bountyId,
-            specialty: d.specialty ?? cur.specialty,
-          },
-        };
-      });
-    });
-    es.addEventListener("worker_phase", (e) => {
-      const d = JSON.parse(e.data) as {
-        node_key: string;
-        phase: string;
-        bounty_id?: string | null;
-      };
-      const k = d.node_key;
-      setWorkerInsights((prev) => {
-        const cur = prev[k] ?? {
-          toolText: "",
-          modelText: "",
-          phase: "idle",
-        };
-        const reset = shouldResetInsightForBounty(cur.bountyId, d.bounty_id);
-        return {
-          ...prev,
-          [k]: {
-            ...cur,
-            toolText: reset ? "" : cur.toolText,
-            modelText: reset ? "" : cur.modelText,
-            phase: d.phase,
-            bountyId: reset
-              ? (d.bounty_id ?? undefined)
-              : (d.bounty_id ?? cur.bountyId),
-          },
-        };
-      });
-    });
-    es.addEventListener("bounty_resolving", (e) => {
-      const { bounty_id } = JSON.parse(e.data);
-      addLog("resolve", `Claim window closed — resolving #${bounty_id}`);
-    });
-    es.addEventListener("arbiter_result", (e) => {
-      const { bounty_id, winner_node_key, reason, source } = JSON.parse(e.data);
-      addLog(
-        "arb",
-        `#${bounty_id} → ${winner_node_key} (${source}) ${(reason || "").slice(0, 100)}`,
-      );
-    });
-    es.addEventListener("bounty_posted", (e) => {
-      const { bounty_id, task: t, reward: rw, deposit_tx } = JSON.parse(e.data);
-      setBounties((prev) => [
-        { bounty_id, task: t, reward: rw ?? "", status: "PENDING", bids: [], deposit_tx: deposit_tx || undefined },
-        ...prev,
-      ]);
-      addLog(
-        "new",
-        `#${bounty_id} — ${t.slice(0, 60)}${t.length > 60 ? "…" : ""}`,
-      );
-      const keys = workerKeysRef.current;
-      keys.forEach((wk) => spawnTrain("emitter", wk, "amber"));
-    });
-    es.addEventListener("payment_tx", (e) => {
-      const { bounty_id, tx_url, refund } = JSON.parse(e.data) as {
-        bounty_id: string;
-        tx_url: string;
-        refund?: boolean;
-      };
-      setBounties((prev) =>
-        prev.map((b) =>
-          b.bounty_id === bounty_id ? { ...b, payment_tx: tx_url } : b,
-        ),
-      );
-      addLog(refund ? "exp" : "done", `⛓ ${refund ? "Refund" : "Payment"} TX: ${tx_url.slice(-16)}…`);
-      if (!refund) setRepRefreshTick((t) => t + 1);
-    });
-    es.addEventListener("worker_claimed", (e) => {
-      const { bounty_id, specialty, node_key } = JSON.parse(e.data);
-      if (node_key && nodesRef.current[node_key]) {
-        setNodeStatus(node_key, "claiming");
-        spawnTrain(node_key, "emitter", "emerald");
-      }
-      setBounties((prev) =>
-        prev.map((b) =>
-          b.bounty_id === bounty_id
-            ? {
-                ...b,
-                bids: [
-                  ...b.bids.filter((bd) => bd.node_key !== node_key),
-                  { node_key, specialty, outcome: "bid" as const },
-                ],
-              }
-            : b,
-        ),
-      );
-      addLog("bid", `${specialty} bid on #${bounty_id}`);
-    });
-    es.addEventListener("worker_awarded", (e) => {
-      const { bounty_id, specialty, node_key, worker_id } = JSON.parse(e.data);
-      if (node_key && nodesRef.current[node_key]) {
-        setNodeStatus(node_key, "working");
-        spawnTrain("emitter", node_key, "emeraldBright");
-      }
-      setBounties((prev) =>
-        prev.map((b) =>
-          b.bounty_id === bounty_id
-            ? {
-                ...b,
-                status: "EXECUTING",
-                winner_specialty: specialty,
-                worker_id,
-                bids: b.bids.map((bd) =>
-                  bd.node_key === node_key ? { ...bd, outcome: "awarded" as const } : bd,
-                ),
-              }
-            : b,
-        ),
-      );
-      addLog("win", `${specialty} awarded #${bounty_id}`);
-    });
-    es.addEventListener("worker_rejected", (e) => {
-      const { specialty, node_key, bounty_id } = JSON.parse(e.data);
-      if (node_key && nodesRef.current[node_key]) {
-        flashNode(node_key, "rejected", 2000);
-        spawnTrain("emitter", node_key, "red");
-      }
-      setBounties((prev) =>
-        prev.map((b) =>
-          b.bounty_id === bounty_id
-            ? {
-                ...b,
-                bids: b.bids.map((bd) =>
-                  bd.node_key === node_key ? { ...bd, outcome: "rejected" as const } : bd,
-                ),
-              }
-            : b,
-        ),
-      );
-      addLog("rej", `${specialty} stood down`);
-    });
-    es.addEventListener("bounty_collaborating", (e) => {
-      const { bounty_id, workers } = JSON.parse(e.data) as {
-        bounty_id: string;
-        workers: { node_key: string; specialty: string; is_lead: boolean }[];
-      };
-      workers.forEach(({ node_key }) => {
-        if (nodesRef.current[node_key]) setNodeStatus(node_key, "working");
-      });
-      setBounties((prev) =>
-        prev.map((b) =>
-          b.bounty_id === bounty_id
-            ? {
-                ...b,
-                status: "COLLABORATING",
-                collaborating_workers: workers.map((w) => w.node_key),
-                winner_specialty: workers.map((w) => w.specialty).join(" + "),
-              }
-            : b,
-        ),
-      );
-      const specialties = workers.map((w) => w.specialty).join(" & ");
-      addLog("collab", `${specialties} collaborating on #${bounty_id}`);
-    });
-
-    es.addEventListener("worker_direct_message", (e) => {
-      const { from_node_key, to_node_key } = JSON.parse(e.data) as {
-        bounty_id: string;
-        from_node_key: string;
-        to_node_key: string;
-        msg_type: string;
-      };
-      spawnTrain(from_node_key, to_node_key, "violet");
-      const fromLabel = nodesRef.current[from_node_key]?.label ?? from_node_key;
-      const toLabel   = nodesRef.current[to_node_key]?.label   ?? to_node_key;
-      addLog("p2p", `Direct: ${fromLabel} → ${toLabel}`);
-    });
-
-    es.addEventListener("bounty_completed", (e) => {
-      const {
-        bounty_id,
-        result,
-        specialty,
-        collaboration,
-        node_key: completingNodeKey,
-        images,
-      } = JSON.parse(e.data) as {
-        bounty_id: string;
-        result: string;
-        specialty: string;
-        collaboration?: boolean;
-        node_key?: string;
-        images?: BountyImage[];
-      };
-      setBounties((prev) =>
-        prev.map((b) =>
-          b.bounty_id === bounty_id
-            ? {
-                ...b,
-                status: "COMPLETED",
-                result,
-                images: images && images.length ? images : undefined,
-                winner_specialty: specialty,
-                collaboration,
-              }
-            : b,
-        ),
-      );
-      setExpandedId(bounty_id);
-      setRepRefreshTick((t) => t + 1);
-      const label = collaboration ? `${specialty} (collaborative)` : specialty;
-      addLog(
-        "done",
-        `${label}: ${result.slice(0, 80)}${result.length > 80 ? "…" : ""}`,
-      );
-      // Bridge now sends node_key directly; fall back to specialty lookup for non-collab
-      if (completingNodeKey && workerKeysRef.current.includes(completingNodeKey)) {
-        spawnTrain(completingNodeKey, "emitter", "emeraldDim");
-      } else if (!collaboration) {
-        const allWorkerKeys = meshWorkersRef.current.length > 0
-          ? meshWorkersRef.current.map((w) => w.node_key)
-          : Object.keys(nodesRef.current).filter((k) => k !== "emitter");
-        const winner = resolveWorkerNodeBySpecialty(specialty, nodesRef.current, allWorkerKeys);
-        if (winner && workerKeysRef.current.includes(winner)) {
-          spawnTrain(winner, "emitter", "emeraldDim");
-        }
-      }
-    });
-
-    es.addEventListener("bounty_images_updated", (e) => {
-      const { bounty_id, images } = JSON.parse(e.data) as {
-        bounty_id: string;
-        images?: BountyImage[];
-      };
-      if (!images?.length) return;
-      setBounties((prev) =>
-        prev.map((b) =>
-          b.bounty_id === bounty_id ? { ...b, images } : b,
-        ),
-      );
-    });
-
-    es.addEventListener("bounty_unclaimed", (e) => {
-      const { bounty_id } = JSON.parse(e.data);
-      setBounties((prev) =>
-        prev.map((b) =>
-          b.bounty_id === bounty_id ? { ...b, status: "UNCLAIMED" } : b,
-        ),
-      );
-      addLog("exp", `#${bounty_id} expired`);
-    });
-
-    return () => es.close();
-  }, [spawnTrain, flashNode, setExpandedId]);
 
   const submitBounty = async (e: React.FormEvent, overrideTask?: string, overrideRewardEth?: string) => {
     e.preventDefault();
