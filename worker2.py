@@ -427,10 +427,22 @@ async def handle_collaboration(payload: dict, fallback_emitter_peer_id: str) -> 
         "Lead" if is_lead else "Non-lead", bounty_id, peer_specialties,
     )
 
-    collab_prompt = SYSTEM_PROMPT + (
-        f"\nIMPORTANT: Other specialists ({', '.join(peer_specialties)}) are also handling "
-        f"this task. Focus EXCLUSIVELY on your {SPECIALTY} domain."
-    )
+    if is_lead:
+        collab_prompt = SYSTEM_PROMPT + (
+            f"\nIMPORTANT: You are the LEAD collaborating with {', '.join(peer_specialties)}. "
+            f"Focus EXCLUSIVELY on your {SPECIALTY} domain. "
+            f"Use your tools to gather data and store key results in shared memory "
+            f"(shared_memory_put) so your collaborators can use them."
+        )
+    else:
+        collab_prompt = SYSTEM_PROMPT + (
+            f"\nIMPORTANT: You are collaborating with {', '.join(peer_specialties)} who is gathering data. "
+            f"Your job is to create the visual output for this task. "
+            f"First, read the data your collaborator stored using shared_memory_get "
+            f"(try keys like 'defi_tvl_data', 'research_summary', 'eth_price', 'uniswap_pools'). "
+            f"Then call gemini_generate_image with a detailed prompt incorporating that data. "
+            f"Do NOT just describe what you will do — actually call the tools now."
+        )
 
     try:
         my_out = await asyncio.wait_for(
