@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
-import re
 from pathlib import Path
 from typing import Optional
-
-import requests
 from openai import OpenAI
 
 from worker_telemetry import (
@@ -23,7 +21,16 @@ from worker_tools.base import ToolContext
 from worker_tools.local_registry import capability_manifest_for, tools_for_data_analyst
 from worker_tools.runtime import run_agent_with_tools
 
-from worker_image_merge import merge_bounty_images
+from worker_tools.artifact_store import merge_bounty_images
+from worker_core import (
+    MessageRouter,
+    load_env,
+    parse_claim_json,
+    axl_send as axl_send_base,
+    axl_recv as axl_recv_base,
+    run_recv_loop,
+)
+from collab_protocol import collab_memory_hint, collab_read_hint
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,27 +39,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+router = MessageRouter()
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-def _load_env(path: Path) -> None:
-    if not path.exists():
-        logger.warning(".env not found at %s — set LLM_PROVIDER etc. manually.", path)
-        return
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, _, v = line.partition("=")
-            k, v = k.strip(), v.strip().strip('"').strip("'")
-            if k and k not in os.environ:
-                os.environ[k] = v
-
-
-_load_env(Path(__file__).parent / ".env")
+load_env(Path(__file__).parent / ".env")
 
 WORKER_API   = "http://127.0.0.1:8002"
+axl_send = functools.partial(axl_send_base, worker_api=WORKER_API)
+axl_recv = functools.partial(axl_recv_base, WORKER_API)
 OWN_NODE_KEY = "worker_1"
 MOCK_MODE    = os.environ.get("MOCK_MODE", "false").lower() in ("1", "true", "yes")
 ETH_ADDRESS  = os.environ.get("WORKER1_ETH_ADDRESS", "")
@@ -101,32 +97,6 @@ SYSTEM_PROMPT = (
 )
 MOCK_RESULT = "MOCK: ETH showed 0.72 correlation to CPI over 5 years based on historical data."
 
-# ── AXL helpers ───────────────────────────────────────────────────────────────
-
-def axl_send(peer_id: str, payload: dict) -> bool:
-    try:
-        res = requests.post(
-            f"{WORKER_API}/send",
-            headers={"X-Destination-Peer-Id": peer_id},
-            data=json.dumps(payload).encode("utf-8"),
-            timeout=5,
-        )
-        return res.status_code == 200
-    except Exception as e:
-        logger.debug("axl_send failed: %s", e)
-        return False
-
-
-def axl_recv() -> tuple[Optional[str], Optional[dict]]:
-    try:
-        res = requests.get(f"{WORKER_API}/recv", timeout=5)
-        if res.status_code == 200 and res.text.strip():
-            return res.headers.get("X-From-Peer-Id", ""), res.json()
-    except Exception:
-        pass
-    return None, None
-
-
 # ── LLM calls (blocking — run in executor) ────────────────────────────────────
 
 _CLAIM_JSON_INSTRUCTION_DA = (
@@ -140,21 +110,6 @@ _CLAIM_JSON_INSTRUCTION_DA = (
     f"You have tools (IDs): {CAPABILITIES.get('tool_ids', [])}. Mention in claim_rationale "
     "if a tool is critical to satisfying the task."
 )
-
-
-def _parse_claim_json(text: str) -> dict:
-    text = (text or "").strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    m = re.search(r"\{[\s\S]*\}", text)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except json.JSONDecodeError:
-            pass
-    return {}
 
 
 def evaluate_claim(task: str, bounty_id: str | None = None) -> dict:
@@ -172,7 +127,7 @@ def evaluate_claim(task: str, bounty_id: str | None = None) -> dict:
             bounty_id=bounty_id,
             stream_id=sid,
         )
-        return _parse_claim_json(raw)
+        return parse_claim_json(raw)
     try:
         raw = stream_completion_text(
             client,
@@ -190,7 +145,7 @@ def evaluate_claim(task: str, bounty_id: str | None = None) -> dict:
             max_tokens=180,
             timeout=28.0,
         )
-        data = _parse_claim_json(raw)
+        data = parse_claim_json(raw)
         sc = bool(data.get("should_claim", False))
         try:
             fs = float(data.get("fit_score", 0.0))
@@ -289,76 +244,6 @@ def merge_results(
     return "\n\n".join([my_result] + peer_results)
 
 
-def _collab_share_from_payload(payload: dict) -> dict:
-    """Normalize COLLAB_SHARE body (text + optional embedded images)."""
-    r = payload.get("result", "")
-    if not isinstance(r, str):
-        r = str(r) if r is not None else ""
-    imgs = payload.get("images")
-    if not isinstance(imgs, list):
-        imgs = []
-    return {"result": r, "images": imgs}
-
-
-# ── Message router ────────────────────────────────────────────────────────────
-
-class MessageRouter:
-    """Routes inbound AXL messages to coroutines waiting on them by bounty_id.
-
-    - AWARD / COLLAB_AWARD / REJECTED → asyncio.Future (one response per bounty)
-    - COLLAB_SHARE → asyncio.Queue (N-1 responses for N-worker collaboration)
-    """
-
-    def __init__(self) -> None:
-        self._decisions: dict[str, asyncio.Future] = {}
-        self._collab_shares: dict[str, asyncio.Queue] = {}
-        # Buffer shares that arrive before the lead registers its queue
-        self._share_buffer: dict[str, list[dict]] = {}
-
-    def register_decision(self, bounty_id: str) -> asyncio.Future:
-        fut: asyncio.Future = asyncio.get_event_loop().create_future()
-        self._decisions[bounty_id] = fut
-        return fut
-
-    def unregister_decision(self, bounty_id: str) -> None:
-        self._decisions.pop(bounty_id, None)
-
-    def register_collab_shares(self, bounty_id: str) -> asyncio.Queue:
-        q: asyncio.Queue = asyncio.Queue()
-        for buffered in self._share_buffer.pop(bounty_id, []):
-            if isinstance(buffered, str):
-                buffered = {"result": buffered, "images": []}
-            q.put_nowait(buffered)
-        self._collab_shares[bounty_id] = q
-        return q
-
-    def unregister_collab_shares(self, bounty_id: str) -> None:
-        self._collab_shares.pop(bounty_id, None)
-        self._share_buffer.pop(bounty_id, None)
-
-    def dispatch(self, msg_type: str, bounty_id: str, payload: dict) -> bool:
-        """Route message to a waiting coroutine. Returns True if consumed."""
-        if msg_type in ("AWARD", "COLLAB_AWARD", "REJECTED"):
-            fut = self._decisions.get(bounty_id)
-            if fut and not fut.done():
-                fut.set_result((msg_type, payload))
-                return True
-
-        elif msg_type == "COLLAB_SHARE":
-            share = _collab_share_from_payload(payload)
-            q = self._collab_shares.get(bounty_id)
-            if q is not None:
-                q.put_nowait(share)
-            else:
-                self._share_buffer.setdefault(bounty_id, []).append(share)
-            return True
-
-        return False
-
-
-router = MessageRouter()
-
-
 # ── Task handlers ─────────────────────────────────────────────────────────────
 
 async def handle_collaboration(payload: dict, fallback_emitter_peer_id: str) -> None:
@@ -392,7 +277,8 @@ async def handle_collaboration(payload: dict, fallback_emitter_peer_id: str) -> 
         f"(market_price_usd, uniswap_v3_pool_snapshot, web_search). "
         f"After gathering data, you MUST store your key findings in shared memory using "
         f"shared_memory_put so your collaborators can use them. "
-        f"Use clear keys like 'defi_tvl_data', 'eth_price', 'uniswap_pools', 'research_summary'. "
+        f"Use clear keys among: {collab_memory_hint('data')}. "
+        f"You may read peer context from keys: {collab_read_hint('data')}. "
         f"Do NOT skip the tool calls — your collaborators are waiting for this data."
     )
 
@@ -587,22 +473,7 @@ async def handle_new_bounty(from_peer: str, payload: dict) -> None:
 # ── Recv loop ─────────────────────────────────────────────────────────────────
 
 async def recv_loop() -> None:
-    loop = asyncio.get_event_loop()
-    while True:
-        try:
-            from_peer, payload = await loop.run_in_executor(None, axl_recv)
-            if payload:
-                msg_type  = payload.get("type", "")
-                bounty_id = payload.get("bounty_id", "")
-
-                if not router.dispatch(msg_type, bounty_id, payload):
-                    if msg_type == "NEW_BOUNTY":
-                        asyncio.create_task(handle_new_bounty(from_peer, payload))
-                    else:
-                        logger.debug("Unrouted msg type=%s bounty=%s", msg_type, bounty_id)
-        except Exception as e:
-            logger.warning("recv_loop error: %s", e)
-        await asyncio.sleep(0.2)
+    await run_recv_loop(router, WORKER_API, handle_new_bounty, log=logger)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
