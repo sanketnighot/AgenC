@@ -10,4 +10,6 @@ agent_api.egg-info/dependency_links.txt
 agent_api.egg-info/requires.txt
 agent_api.egg-info/top_level.txt
 tests/test_arbiter.py
+tests/test_bounty_fsm.py
+tests/test_sse_publisher.py
 tests/test_telemetry.py

@@ -1,13 +1,14 @@
 import asyncio
 import json
 import logging
-import pathlib
 import time
 import uuid
 from typing import AsyncGenerator
 
 import requests
 import config
+from bounty_fsm import BountyFSM
+from sse_publisher import publisher
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -80,7 +81,7 @@ WORKER_NODES = {
 }
 
 # ── In-memory state ───────────────────────────────────────────────────────────
-bounties: dict = {}
+fsm = BountyFSM(BOUNTIES_FILE)
 
 # Initialise node_states dynamically from WORKER_NODES so N workers work without hardcoding
 node_states: dict = {
@@ -101,71 +102,13 @@ PEER_ID_FULL_TO_NODE = {
     v["peer_id"]: k for k, v in WORKER_NODES.items()
 }
 
-bounty_locks: dict[str, asyncio.Lock] = {}
-
-
-def _save_bounties() -> None:
-    try:
-        pathlib.Path(BOUNTIES_FILE).write_text(json.dumps(bounties, default=str))
-    except Exception as e:
-        logger.warning("save_bounties failed: %s", e)
-
-
-def _merge_image_payloads(
-    existing: list,
-    new_images: list,
-    *,
-    max_images: int = 12,
-) -> list:
-    """Dedupe-merge bounty image dicts when a worker sends a supplemental COMPLETED_BOUNTY."""
-    out: list = []
-    seen: set[str] = set()
-    for group in (existing, new_images):
-        if not isinstance(group, list):
-            continue
-        for img in group:
-            if len(out) >= max_images:
-                return out
-            if not isinstance(img, dict):
-                continue
-            db = img.get("data_base64")
-            if not isinstance(db, str) or not db.strip():
-                continue
-            key = db[:240]
-            if key in seen:
-                continue
-            seen.add(key)
-            mime = img.get("mime") if isinstance(img.get("mime"), str) else "image/png"
-            out.append({"mime": mime, "data_base64": db})
-    return out
-
-
-def _load_bounties() -> None:
-    try:
-        data = json.loads(pathlib.Path(BOUNTIES_FILE).read_text())
-        bounties.update(data)
-    except Exception:
-        pass
-
-
-def _lock(bounty_id: str) -> asyncio.Lock:
-    if bounty_id not in bounty_locks:
-        bounty_locks[bounty_id] = asyncio.Lock()
-    return bounty_locks[bounty_id]
-
-
 def resolve_node_key(peer_id: str) -> str:
     p = peer_id.strip().lower()
     return PEER_ID_FULL_TO_NODE.get(p) or PEER_ID_TO_NODE.get(p[:8], "")
 
 
-sse_clients: list[asyncio.Queue] = []
-
-
 async def broadcast(event: str, data: dict) -> None:
-    msg = f"event: {event}\ndata: {json.dumps(data)}\n\n"
-    for q in list(sse_clients):  # copy to avoid race on concurrent disconnect
-        await q.put(msg)
+    await publisher.publish(event, data)
 
 
 def _axl_send(peer_id: str, payload: dict) -> bool:
@@ -262,8 +205,8 @@ async def recv_loop() -> None:
 
 async def _force_unclaimed(bounty_id: str) -> None:
     reward_wei = 0
-    async with _lock(bounty_id):
-        b = bounties.get(bounty_id)
+    async with fsm.lock(bounty_id):
+        b = fsm.bounties.get(bounty_id)
         if not b or b["status"] != "PENDING":
             return
         # Don't race with resolve_bounty mid-arbitration
@@ -282,13 +225,13 @@ async def _force_unclaimed(bounty_id: str) -> None:
                 await broadcast("payment_tx", {"bounty_id": bounty_id, "tx_url": tx_url, "refund": True})
         except Exception as exc:
             logger.error("Refund failed for bounty %s: %s", bounty_id, exc)
-    _save_bounties()
+    fsm.save()
 
 
 async def _force_collab_timeout(bounty_id: str) -> None:
     """Force a stalled COLLABORATING bounty to UNCLAIMED and idle all nodes."""
-    async with _lock(bounty_id):
-        b = bounties.get(bounty_id)
+    async with fsm.lock(bounty_id):
+        b = fsm.bounties.get(bounty_id)
         if not b or b["status"] != "COLLABORATING":
             return
         collaborators = list(b.get("collaborators") or [])
@@ -307,7 +250,7 @@ async def _force_collab_timeout(bounty_id: str) -> None:
 async def timeout_watcher() -> None:
     while True:
         now = time.time()
-        for bounty_id, b in list(bounties.items()):
+        for bounty_id, b in list(fsm.bounties.items()):
             status = b.get("status")
 
             if status == "PENDING":
@@ -357,8 +300,8 @@ async def _delayed_resolve(bounty_id: str, wake_at: float) -> None:
 async def resolve_bounty(bounty_id: str) -> None:
     loop = asyncio.get_event_loop()
 
-    async with _lock(bounty_id):
-        b = bounties.get(bounty_id)
+    async with fsm.lock(bounty_id):
+        b = fsm.bounties.get(bounty_id)
         if not b or b["status"] != "PENDING":
             return
         if b.get("claim_phase") != "collecting":
@@ -367,8 +310,8 @@ async def resolve_bounty(bounty_id: str) -> None:
 
     await broadcast("bounty_resolving", {"bounty_id": bounty_id})
 
-    async with _lock(bounty_id):
-        b = bounties.get(bounty_id)
+    async with fsm.lock(bounty_id):
+        b = fsm.bounties.get(bounty_id)
         if not b or b["status"] != "PENDING":
             return
         raw = dict(b.get("pending_claims") or {})
@@ -378,8 +321,8 @@ async def resolve_bounty(bounty_id: str) -> None:
 
     if not claims_list:
         reward_wei_nc = 0
-        async with _lock(bounty_id):
-            bb = bounties.get(bounty_id)
+        async with fsm.lock(bounty_id):
+            bb = fsm.bounties.get(bounty_id)
             if bb and bb["status"] == "PENDING":
                 bb["status"] = "UNCLAIMED"
                 bb["claim_phase"] = None
@@ -408,8 +351,8 @@ async def resolve_bounty(bounty_id: str) -> None:
         )
     except Exception as e:
         logger.warning("resolve_winner failed: %s", e)
-        async with _lock(bounty_id):
-            bb = bounties.get(bounty_id)
+        async with fsm.lock(bounty_id):
+            bb = fsm.bounties.get(bounty_id)
             if bb and bb["status"] == "PENDING":
                 bb["status"] = "UNCLAIMED"
                 bb["claim_phase"] = None
@@ -438,8 +381,8 @@ async def resolve_bounty(bounty_id: str) -> None:
     winner_key = outcome.winner_node_key
     if winner_key not in WORKER_NODES:
         logger.warning("Outcome winner %r not in WORKER_NODES", winner_key)
-        async with _lock(bounty_id):
-            bb = bounties.get(bounty_id)
+        async with fsm.lock(bounty_id):
+            bb = fsm.bounties.get(bounty_id)
             if bb and bb["status"] == "PENDING":
                 bb["status"] = "UNCLAIMED"
                 bb["claim_phase"] = None
@@ -457,11 +400,11 @@ async def resolve_bounty(bounty_id: str) -> None:
     short_id = str(from_peer)[:8]
     claim_peer_keys = list(raw.keys())
 
-    async with _lock(bounty_id):
-        bb = bounties.get(bounty_id)
+    async with fsm.lock(bounty_id):
+        bb = fsm.bounties.get(bounty_id)
         if not bb or bb["status"] != "PENDING":
             return
-        bb["status"] = "CLAIMED"
+        bb["status"] = "EXECUTING"
         bb["winner_id"] = from_peer
         bb["winner_specialty"] = specialty
         bb["claims"] = claim_peer_keys
@@ -528,8 +471,8 @@ async def _dispatch_collaboration(
         specialty = (claim.get("specialty") if claim else None) or WORKER_NODES[wk]["specialty"]
         collab_workers_sse.append({"node_key": wk, "specialty": specialty, "is_lead": wk == lead_key})
 
-    async with _lock(bounty_id):
-        bb = bounties.get(bounty_id)
+    async with fsm.lock(bounty_id):
+        bb = fsm.bounties.get(bounty_id)
         if not bb or bb["status"] != "PENDING":
             return
         bb["status"] = "COLLABORATING"
@@ -587,7 +530,7 @@ async def handle_inbound(from_peer: str, payload: dict) -> None:
     bounty_id = payload.get("bounty_id")
 
     if msg_type == "CLAIM":
-        if not bounty_id or bounty_id not in bounties:
+        if not bounty_id or bounty_id not in fsm.bounties:
             return
 
         node_key = resolve_node_key(from_peer)
@@ -614,8 +557,8 @@ async def handle_inbound(from_peer: str, payload: dict) -> None:
         should_schedule = False
         wake_at = 0.0
 
-        async with _lock(bounty_id):
-            bb = bounties[bounty_id]
+        async with fsm.lock(bounty_id):
+            bb = fsm.bounties[bounty_id]
             if bb["status"] != "PENDING":
                 reject_kind = "not_pending"
             elif bb.get("claim_phase") == "resolving":
@@ -681,7 +624,7 @@ async def handle_inbound(from_peer: str, payload: dict) -> None:
         )
 
     elif msg_type == "COMPLETED_BOUNTY":
-        if not bounty_id or bounty_id not in bounties:
+        if not bounty_id or bounty_id not in fsm.bounties:
             return
 
         result_text = payload.get("result", "")
@@ -692,8 +635,8 @@ async def handle_inbound(from_peer: str, payload: dict) -> None:
 
         supplement_evt: dict | None = None
         skip_full_completion = False
-        async with _lock(bounty_id):
-            b = bounties.get(bounty_id)
+        async with fsm.lock(bounty_id):
+            b = fsm.bounties.get(bounty_id)
             if not b:
                 return
             if b["status"] == "UNCLAIMED":
@@ -701,20 +644,20 @@ async def handle_inbound(from_peer: str, payload: dict) -> None:
             if b["status"] == "COMPLETED":
                 skip_full_completion = True
                 if isinstance(images_payload, list) and images_payload:
-                    merged_up = _merge_image_payloads(b.get("images") or [], images_payload)
+                    merged_up = BountyFSM.merge_image_payloads(b.get("images") or [], images_payload)
                     old = b.get("images") or []
                     if merged_up and len(merged_up) > len(old):
                         b["images"] = merged_up
                         supplement_evt = {"bounty_id": bounty_id, "images": merged_up}
-                        _save_bounties()
+                        fsm.save()
 
         if supplement_evt:
             await broadcast("bounty_images_updated", supplement_evt)
         if skip_full_completion:
             return
 
-        async with _lock(bounty_id):
-            b = bounties.get(bounty_id)
+        async with fsm.lock(bounty_id):
+            b = fsm.bounties.get(bounty_id)
             if not b or b["status"] in ("COMPLETED", "UNCLAIMED"):
                 return
             b["status"] = "COMPLETED"
@@ -751,8 +694,8 @@ async def handle_inbound(from_peer: str, payload: dict) -> None:
         await broadcast("bounty_completed", evt)
 
         # ── On-chain settlement ───────────────────────────────────────────────
-        async with _lock(bounty_id):
-            b_pay = bounties.get(bounty_id)
+        async with fsm.lock(bounty_id):
+            b_pay = fsm.bounties.get(bounty_id)
             reward_wei = (b_pay or {}).get("reward_wei", 0)
             all_claims = dict((b_pay or {}).get("pending_claims") or {})
             b_collab_keys = list((b_pay or {}).get("collaborators") or [])
@@ -789,7 +732,7 @@ async def handle_inbound(from_peer: str, payload: dict) -> None:
                     })
             except Exception as exc:
                 logger.error("Payment failed for bounty %s: %s", bounty_id, exc)
-        _save_bounties()
+        fsm.save()
 
 
 async def reputation_poll_loop() -> None:
@@ -805,7 +748,7 @@ async def reputation_poll_loop() -> None:
 @app.on_event("startup")
 async def start_background_tasks() -> None:
     global _last_mesh_json
-    _load_bounties()
+    fsm.load()
     _last_mesh_json = json.dumps(build_mesh_state(), sort_keys=True)
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, refresh_reputation)
@@ -817,8 +760,7 @@ async def start_background_tasks() -> None:
 
 @app.get("/api/events")
 async def events(request: Request) -> StreamingResponse:
-    queue: asyncio.Queue = asyncio.Queue()
-    sse_clients.append(queue)
+    queue = publisher.subscribe()
 
     async def generator() -> AsyncGenerator[str, None]:
         try:
@@ -833,8 +775,7 @@ async def events(request: Request) -> StreamingResponse:
                 except asyncio.TimeoutError:
                     yield ": heartbeat\n\n"
         finally:
-            if queue in sse_clients:
-                sse_clients.remove(queue)
+            publisher.unsubscribe(queue)
 
     return StreamingResponse(
         generator(),
@@ -924,7 +865,7 @@ async def broadcast_bounty(bounty: Bounty) -> dict:
     loop = asyncio.get_event_loop()
     bounty_id = bounty.bounty_id or str(uuid.uuid4())[:8]
 
-    bounties[bounty_id] = {
+    fsm.bounties[bounty_id] = {
         "task": bounty.task,
         "reward": bounty.reward,
         "reward_wei": bounty.reward_wei,
@@ -982,7 +923,7 @@ async def broadcast_bounty(bounty: Bounty) -> dict:
         },
     )
 
-    _save_bounties()
+    fsm.save()
     return {"status": "broadcasted", "bounty_id": bounty_id, "sent_to": success_count}
 
 
@@ -1032,7 +973,7 @@ def _session_reward_wei_for_worker(bounty: dict, node_key: str, peer_id: str) ->
 
 @app.get("/api/bounties/{bounty_id}")
 def get_bounty(bounty_id: str) -> dict:
-    b = bounties.get(bounty_id)
+    b = fsm.bounties.get(bounty_id)
     if not b:
         raise HTTPException(status_code=404, detail="Bounty not found")
     return b
@@ -1040,7 +981,7 @@ def get_bounty(bounty_id: str) -> dict:
 
 @app.get("/api/bounties")
 def get_bounties() -> dict:
-    return bounties
+    return fsm.bounties
 
 
 @app.get("/api/reputation")
@@ -1053,14 +994,14 @@ def get_reputation() -> dict:
         on_chain = rep_cache.get(eth_norm, {}) if eth_norm else {}
         claimed = sum(
             1
-            for b in bounties.values()
+            for b in fsm.bounties.values()
             if any(
                 c.get("node_key") == nk for c in (b.get("pending_claims") or {}).values()
             )
         )
         completed = sum(
             1
-            for b in bounties.values()
+            for b in fsm.bounties.values()
             if b.get("status") == "COMPLETED"
             and (
                 nk in (b.get("collaborators") or [])
@@ -1069,7 +1010,7 @@ def get_reputation() -> dict:
         )
         session_reward_wei = sum(
             _session_reward_wei_for_worker(b, nk, wv["peer_id"])
-            for b in bounties.values()
+            for b in fsm.bounties.values()
         )
         result[nk] = {
             "label": node_states[nk]["label"],
@@ -1086,7 +1027,6 @@ def get_reputation() -> dict:
 
 @app.delete("/api/bounties")
 def clear_bounties() -> dict:
-    bounties.clear()
-    bounty_locks.clear()
-    _save_bounties()
+    fsm.clear()
+    fsm.save()
     return {"status": "cleared"}
