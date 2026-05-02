@@ -11,6 +11,13 @@ from worker_tools.gemini_image import CREATIVE_LOCAL_TOOLS
 from worker_tools.mcp_proxy import _mcp_route_endpoint, mcp_tools_call
 from worker_tools.uniswap import DATA_ANALYST_LOCAL_TOOLS
 
+try:
+    from collab_protocol import artifact_producer_for
+except ImportError:
+    # Fallback when worker_tools is imported outside repo root (tests).
+    def artifact_producer_for(role: str) -> bool:
+        return role != "data"
+
 logger = logging.getLogger(__name__)
 
 
@@ -254,5 +261,5 @@ def capability_manifest_for(role: str) -> dict:
     return {
         "tool_ids": ids,
         "tool_classes": sorted(set(classes)),
-        "supports_artifact_output": role != "data",
+        "supports_artifact_output": artifact_producer_for(role),
     }

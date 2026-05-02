@@ -50,6 +50,7 @@ class ToolSpec:
     description: str
     parameters: JsonDict
     handler: ToolHandler
+    triggers_artifact: bool = False  # if True, runtime may nudge when no artifact_paths yet
 
     def openai_tool_dict(self) -> dict[str, Any]:
         return {

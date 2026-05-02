@@ -111,8 +111,6 @@ def handle_gemini_generate_image(args: dict[str, Any], ctx: ToolContext) -> Tool
     )
 
 
-from worker_tools.base import ToolSpec
-
 CREATIVE_LOCAL_TOOLS: list[ToolSpec] = [
     ToolSpec(
         name="gemini_generate_image",
@@ -135,5 +133,6 @@ CREATIVE_LOCAL_TOOLS: list[ToolSpec] = [
             "required": ["prompt"],
         },
         handler=lambda a, c: handle_gemini_generate_image(a, c),
+        triggers_artifact=True,
     ),
 ]
