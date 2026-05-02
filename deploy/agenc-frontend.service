@@ -1,0 +1,18 @@
+[Unit]
+Description=AgenC Frontend (Next.js)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/axl/agenc-frontend
+Environment=NODE_ENV=production
+Environment=PORT=3000
+ExecStart=/usr/bin/node_modules/.bin/next start -p 3000
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
