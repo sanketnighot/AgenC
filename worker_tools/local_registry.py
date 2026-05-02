@@ -53,6 +53,30 @@ def _parse_mcp_response(data: dict) -> ToolResult:
     return ToolResult(True, data={"raw": data})
 
 
+def _handle_perplexity_web_search(args: dict, _ctx: ToolContext) -> ToolResult:
+    """Search via Perplexity Sonar (grounded, synthesized results)."""
+    import requests as _requests
+    q = (args.get("query") or "").strip()
+    if not q:
+        return ToolResult(False, error="query is required")
+    api_key = os.environ.get("PERPLEXITY_API_KEY", "").strip()
+    if not api_key:
+        return ToolResult(False, error="PERPLEXITY_API_KEY not set")
+    try:
+        r = _requests.post(
+            "https://api.perplexity.ai/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": "sonar", "messages": [{"role": "user", "content": q}]},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            return ToolResult(False, error=f"Perplexity HTTP {r.status_code}: {r.text[:300]}")
+        content = r.json()["choices"][0]["message"]["content"]
+        return ToolResult(True, data={"text": content})
+    except Exception as e:
+        return ToolResult(False, error=str(e))
+
+
 def _handle_mcp_web_search(args: dict, ctx: ToolContext) -> ToolResult:
     q = (args.get("query") or "").strip()
     if not q:
@@ -71,6 +95,13 @@ def _handle_mcp_web_search(args: dict, ctx: ToolContext) -> ToolResult:
         {"query": q},
     )
     return _parse_mcp_response(raw)
+
+
+def _handle_web_search(args: dict, ctx: ToolContext) -> ToolResult:
+    """Use Perplexity Sonar if API key is set, otherwise fall back to MCP DuckDuckGo."""
+    if os.environ.get("PERPLEXITY_API_KEY", "").strip():
+        return _handle_perplexity_web_search(args, ctx)
+    return _handle_mcp_web_search(args, ctx)
 
 
 def _handle_mcp_memory_put(args: dict, ctx: ToolContext) -> ToolResult:
@@ -135,15 +166,15 @@ def _mcp_tool_specs() -> list[ToolSpec]:
         ToolSpec(
             name="web_search",
             description=(
-                "Search the web via the MCP web-search service (DuckDuckGo-backed). "
-                "Use for fresh facts, news, or citations."
+                "Search the web for fresh facts, news, prices, or citations. "
+                "Uses Perplexity Sonar when PERPLEXITY_API_KEY is set, otherwise DuckDuckGo via MCP."
             ),
             parameters={
                 "type": "object",
                 "properties": {"query": {"type": "string"}},
                 "required": ["query"],
             },
-            handler=lambda a, c: _handle_mcp_web_search(a, c),
+            handler=lambda a, c: _handle_web_search(a, c),
         ),
         ToolSpec(
             name="shared_memory_put",
@@ -189,18 +220,22 @@ def _mcp_tool_specs() -> list[ToolSpec]:
     ]
 
 
+def _perplexity_enabled() -> bool:
+    return bool(os.environ.get("PERPLEXITY_API_KEY", "").strip())
+
+
 def tools_for_data_analyst(worker_api_base: str) -> list[ToolSpec]:
     tools = list(DATA_ANALYST_LOCAL_TOOLS)
-    if _mcp_tools_enabled():
+    if _mcp_tools_enabled() or _perplexity_enabled():
         tools.extend(_mcp_tool_specs())
     elif worker_api_base:
-        logger.debug("MCP unset — MCP tools disabled (set MCP_ROUTER_HTTP or MCP_SERVICE_PEER_ID)")
+        logger.debug("MCP and Perplexity unset — web_search disabled")
     return tools
 
 
 def tools_for_creative_strategist(worker_api_base: str) -> list[ToolSpec]:
     tools = list(CREATIVE_LOCAL_TOOLS)
-    if _mcp_tools_enabled():
+    if _mcp_tools_enabled() or _perplexity_enabled():
         tools.extend(_mcp_tool_specs())
     return tools
 
@@ -213,7 +248,7 @@ def capability_manifest_for(role: str) -> dict:
     else:
         ids = [t.name for t in CREATIVE_LOCAL_TOOLS]
         classes = ["image_generation", "creative"]
-    if _mcp_tools_enabled():
+    if _mcp_tools_enabled() or _perplexity_enabled():
         ids.extend(["web_search", "shared_memory_put", "shared_memory_get", "shared_memory_list"])
         classes.extend(["web_search", "memory"])
     return {

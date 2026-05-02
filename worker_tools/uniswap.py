@@ -14,10 +14,17 @@ from worker_tools.base import ToolContext, ToolResult, ToolSpec
 
 logger = logging.getLogger(__name__)
 
-# Default public subgraph (may require migrating to The Graph decentralized network in production).
-DEFAULT_UNISWAP_V3_SUBGRAPH = (
-    "https://api.thegraph.com/subgraphs/name/uniswap/uniswap-v3"
-)
+# The Graph hosted service is deprecated. Set THEGRAPH_API_KEY to use the decentralized network,
+# or set UNISWAP_V3_SUBGRAPH_URL to override entirely.
+_THEGRAPH_DECENTRAL_SUBGRAPH_ID = "5zvR82QoaXYFyDEKLZ9t6v9adgnptxYpKpSbxtgVENFV"
+
+
+def _get_subgraph_url() -> str:
+    if custom := os.environ.get("UNISWAP_V3_SUBGRAPH_URL"):
+        return custom
+    if api_key := os.environ.get("THEGRAPH_API_KEY"):
+        return f"https://gateway.thegraph.com/api/{api_key}/subgraphs/id/{_THEGRAPH_DECENTRAL_SUBGRAPH_ID}"
+    return ""
 
 # Ethereum mainnet common tokens (lowercase hex address)
 MAINNET_TOKENS: dict[str, str] = {
@@ -88,7 +95,12 @@ def handle_market_price_usd(args: dict[str, Any], _ctx: ToolContext) -> ToolResu
 
 
 def _subgraph_query(query: str, variables: dict[str, Any]) -> dict[str, Any]:
-    endpoint = os.environ.get("UNISWAP_V3_SUBGRAPH_URL", DEFAULT_UNISWAP_V3_SUBGRAPH)
+    endpoint = _get_subgraph_url()
+    if not endpoint:
+        return {"errors": [{"message": (
+            "Uniswap V3 subgraph not configured. "
+            "Set THEGRAPH_API_KEY (free at thegraph.com) or UNISWAP_V3_SUBGRAPH_URL."
+        )}]}
     try:
         r = requests.post(
             endpoint,

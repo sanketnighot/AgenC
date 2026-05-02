@@ -1,6 +1,6 @@
 "use client";
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { useAccount, useConnect, useDisconnect, useBalance, useWriteContract, useWaitForTransactionReceipt } from "wagmi";
+import { useAccount, useConnect, useDisconnect, useBalance, useWriteContract, useWaitForTransactionReceipt, usePublicClient } from "wagmi";
 import { injected } from "wagmi/connectors";
 import { parseEther, keccak256, toBytes } from "viem";
 
@@ -402,6 +402,7 @@ export default function Home() {
   const { disconnect } = useDisconnect();
   const { data: balance } = useBalance({ address });
   const { writeContractAsync } = useWriteContract();
+  const publicClient = usePublicClient();
   const [pendingTxHash, setPendingTxHash] = useState<`0x${string}` | undefined>();
   const { isLoading: isTxConfirming } = useWaitForTransactionReceipt({ hash: pendingTxHash });
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -816,30 +817,29 @@ export default function Home() {
     e.preventDefault();
     const t = overrideTask ?? task;
     const ethAmount = overrideRewardEth ?? rewardEth;
-    if (!t.trim()) return;
+    if (!t.trim() || !isConnected || !address) return;
     setSubmitting(true);
     try {
-      // Generate bounty_id upfront so contract + backend agree
       const bountyId = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
       const bountyIdBytes32 = keccak256(toBytes(bountyId));
       const rewardWei = parseEther(ethAmount || "0");
 
-      let txHash = "";
-      let posterAddress = "";
+      // Step 1: send escrow deposit — MetaMask will pop up
+      const hash = await writeContractAsync({
+        address: CONTRACT_ADDRESS,
+        abi: BOUNTY_ESCROW_ABI,
+        functionName: "postBounty",
+        args: [bountyIdBytes32],
+        value: rewardWei,
+      });
+      setPendingTxHash(hash);
 
-      if (isConnected && address && CONTRACT_ADDRESS && rewardWei > BigInt(0)) {
-        const hash = await writeContractAsync({
-          address: CONTRACT_ADDRESS,
-          abi: BOUNTY_ESCROW_ABI,
-          functionName: "postBounty",
-          args: [bountyIdBytes32],
-          value: rewardWei,
-        });
-        txHash = hash;
-        posterAddress = address;
-        setPendingTxHash(hash);
+      // Step 2: wait for on-chain confirmation before notifying the backend
+      if (publicClient) {
+        await publicClient.waitForTransactionReceipt({ hash, confirmations: 1 });
       }
 
+      // Step 3: notify backend — bounty is now funded on-chain
       await fetch(`${API}/api/bounty`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -847,8 +847,8 @@ export default function Home() {
           task: t,
           reward: `${ethAmount} ETH`,
           reward_wei: Number(rewardWei),
-          tx_hash: txHash,
-          poster_address: posterAddress,
+          tx_hash: hash,
+          poster_address: address,
           bounty_id: bountyId,
         }),
       });
@@ -961,15 +961,15 @@ export default function Home() {
               </div>
               <button
                 type="submit"
-                disabled={submitting || isTxConfirming}
+                disabled={submitting || isTxConfirming || !isConnected}
                 className="shrink-0 rounded-xl bg-emerald-500 px-5 py-2.5 text-sm font-semibold text-zinc-950 transition-colors hover:bg-emerald-400 active:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                {submitting || isTxConfirming ? "…" : isConnected ? "⛓ Broadcast" : "Broadcast"}
+                {submitting ? "Sending…" : isTxConfirming ? "Confirming…" : "⛓ Broadcast"}
               </button>
             </div>
             {!isConnected && (
-              <p className="text-center text-[10px] text-zinc-600">
-                Connect wallet to pay bounty on-chain · or broadcast off-chain without wallet
+              <p className="text-center text-[10px] text-amber-600/80">
+                Connect your wallet first to post a bounty
               </p>
             )}
           </form>
