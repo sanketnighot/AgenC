@@ -13,6 +13,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator
 
 from arbiter import normalize_fit_score, resolve_winner
+from payment import refund_bounty, settle_bounty
 from config import (
     ARBITER_SKIP_WHEN_UNANIMOUS,
     BOUNTY_PENDING_MAX_SEC,
@@ -202,13 +203,16 @@ async def recv_loop() -> None:
                 from_peer, payload = await loop.run_in_executor(None, _axl_recv)
                 if not payload:
                     break
-                await handle_inbound(from_peer, payload)
+                # Spawn as background task so recv_loop keeps draining immediately.
+                # This prevents slow payment settlement from starving the message queue.
+                asyncio.create_task(handle_inbound(from_peer, payload))
         except Exception as e:
             logger.warning("recv_loop error: %s", e)
         await asyncio.sleep(0.3)
 
 
 async def _force_unclaimed(bounty_id: str) -> None:
+    reward_wei = 0
     async with _lock(bounty_id):
         b = bounties.get(bounty_id)
         if not b or b["status"] != "PENDING":
@@ -218,9 +222,17 @@ async def _force_unclaimed(bounty_id: str) -> None:
             return
         b["status"] = "UNCLAIMED"
         b["claim_phase"] = None
+        reward_wei = b.get("reward_wei", 0)
     node_states["emitter"]["status"] = "idle"
     await broadcast("node_status", {"node_id": "emitter", "status": "idle"})
     await broadcast("bounty_unclaimed", {"bounty_id": bounty_id})
+    if reward_wei:
+        try:
+            tx_url = await refund_bounty(bounty_id)
+            if tx_url:
+                await broadcast("payment_tx", {"bounty_id": bounty_id, "tx_url": tx_url, "refund": True})
+        except Exception as exc:
+            logger.error("Refund failed for bounty %s: %s", bounty_id, exc)
 
 
 async def _force_collab_timeout(bounty_id: str) -> None:
@@ -315,14 +327,23 @@ async def resolve_bounty(bounty_id: str) -> None:
         reward_t = b["reward"]
 
     if not claims_list:
+        reward_wei_nc = 0
         async with _lock(bounty_id):
             bb = bounties.get(bounty_id)
             if bb and bb["status"] == "PENDING":
                 bb["status"] = "UNCLAIMED"
                 bb["claim_phase"] = None
+                reward_wei_nc = bb.get("reward_wei", 0)
         node_states["emitter"]["status"] = "idle"
         await broadcast("node_status", {"node_id": "emitter", "status": "idle"})
         await broadcast("bounty_unclaimed", {"bounty_id": bounty_id})
+        if reward_wei_nc:
+            try:
+                tx_url = await refund_bounty(bounty_id)
+                if tx_url:
+                    await broadcast("payment_tx", {"bounty_id": bounty_id, "tx_url": tx_url, "refund": True})
+            except Exception as exc:
+                logger.error("Refund failed for bounty %s: %s", bounty_id, exc)
         return
 
     try:
@@ -566,6 +587,7 @@ async def handle_inbound(from_peer: str, payload: dict) -> None:
                     "fit_score": fit_score,
                     "claim_rationale": rationale,
                     "capabilities": caps,
+                    "eth_address": payload.get("eth_address", ""),
                     "received_at": time.time(),
                 }
 
@@ -653,10 +675,47 @@ async def handle_inbound(from_peer: str, payload: dict) -> None:
         }
         if isinstance(images_payload, list) and images_payload:
             evt["images"] = images_payload
-        await broadcast(
-            "bounty_completed",
-            evt,
-        )
+        await broadcast("bounty_completed", evt)
+
+        # ── On-chain settlement ───────────────────────────────────────────────
+        async with _lock(bounty_id):
+            b_pay = bounties.get(bounty_id)
+            reward_wei = (b_pay or {}).get("reward_wei", 0)
+            all_claims = dict((b_pay or {}).get("pending_claims") or {})
+            b_collab_keys = list((b_pay or {}).get("collaborators") or [])
+            b_collab_mode = (b_pay or {}).get("collaboration_mode", False)
+
+        if reward_wei:
+            try:
+                if b_collab_mode and b_collab_keys:
+                    # Split evenly among all collaborators
+                    worker_addrs = [
+                        c.get("eth_address", "")
+                        for c in all_claims.values()
+                        if c.get("node_key") in b_collab_keys and c.get("eth_address")
+                    ]
+                    if worker_addrs:
+                        split = reward_wei // len(worker_addrs)
+                        tx_url = await settle_bounty(bounty_id, worker_addrs, [split] * len(worker_addrs))
+                    else:
+                        tx_url = ""
+                else:
+                    # Winner-take-all: find completing worker's ETH address
+                    eth_addr = next(
+                        (c.get("eth_address", "") for c in all_claims.values()
+                         if c.get("node_key") == completing_node_key),
+                        "",
+                    )
+                    tx_url = await settle_bounty(bounty_id, [eth_addr], [reward_wei]) if eth_addr else ""
+
+                if tx_url:
+                    await broadcast("payment_tx", {
+                        "bounty_id": bounty_id,
+                        "tx_url": tx_url,
+                        "refund": False,
+                    })
+            except Exception as exc:
+                logger.error("Payment failed for bounty %s: %s", bounty_id, exc)
 
 
 @app.on_event("startup")
@@ -699,6 +758,10 @@ async def events(request: Request) -> StreamingResponse:
 class Bounty(BaseModel):
     task: str
     reward: str
+    reward_wei: int = 0
+    tx_hash: str = ""
+    poster_address: str = ""
+    bounty_id: str | None = None
 
 
 class WorkerTelemetryIn(BaseModel):
@@ -771,11 +834,14 @@ async def post_worker_telemetry(
 @app.post("/api/bounty")
 async def broadcast_bounty(bounty: Bounty) -> dict:
     loop = asyncio.get_event_loop()
-    bounty_id = str(uuid.uuid4())[:8]
+    bounty_id = bounty.bounty_id or str(uuid.uuid4())[:8]
 
     bounties[bounty_id] = {
         "task": bounty.task,
         "reward": bounty.reward,
+        "reward_wei": bounty.reward_wei,
+        "poster_address": bounty.poster_address,
+        "deposit_tx": bounty.tx_hash,
         "status": "PENDING",
         "created_at": time.time(),
         "winner_id": None,
@@ -820,7 +886,12 @@ async def broadcast_bounty(bounty: Bounty) -> dict:
 
     await broadcast(
         "bounty_posted",
-        {"bounty_id": bounty_id, "task": bounty.task, "reward": bounty.reward},
+        {
+            "bounty_id": bounty_id,
+            "task": bounty.task,
+            "reward": bounty.reward,
+            "deposit_tx": bounty.tx_hash,
+        },
     )
 
     return {"status": "broadcasted", "bounty_id": bounty_id, "sent_to": success_count}

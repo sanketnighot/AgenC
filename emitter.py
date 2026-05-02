@@ -31,25 +31,8 @@ for key in WORKER_KEYS:
     except Exception as e:
         print(f"Failed to send: {e}")
 
-print("Listening for claims and completed work over AXL...")
-while True:
-    try:
-        req = requests.get(f"{EMITTER_API}/recv")
-        if req.status_code == 200 and req.text.strip():
-            # 2. AXL tells us who sent it via the HTTP header
-            sender = req.headers.get("X-From-Peer-Id", "Unknown")[:8]
-
-            # 3. The body is exactly our raw JSON
-            payload = req.json()
-
-            if payload.get("type") == "CLAIM":
-                print(f"[*] Worker {sender} claimed the task!")
-            elif payload.get("type") == "COMPLETED_BOUNTY":
-                print(f"\n[+] MISSION ACCOMPLISHED. Received from {sender}:")
-                print(f"Task: {payload.get('task')}")
-                print(f"Result: {payload.get('result')}\n")
-    except json.JSONDecodeError:
-        pass
-    except Exception as e:
-        print(f"Mesh polling error: {e}")
-    time.sleep(2)
+# NOTE: Do NOT run the polling loop below when agenc-api (the bridge) is running.
+# Both scripts poll the same /recv endpoint and AXL delivers each message only once —
+# whichever process polls first steals the message from the other.
+# This file is a standalone test script only; use the frontend + agenc-api instead.
+print("Bounties broadcast. (Polling loop disabled — use agenc-api bridge instead.)")

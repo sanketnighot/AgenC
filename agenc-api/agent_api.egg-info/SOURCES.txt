@@ -9,3 +9,4 @@ agent_api.egg-info/dependency_links.txt
 agent_api.egg-info/requires.txt
 agent_api.egg-info/top_level.txt
 tests/test_arbiter.py
+tests/test_telemetry.py

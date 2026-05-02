@@ -1,5 +1,8 @@
 "use client";
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { useAccount, useConnect, useDisconnect, useBalance, useWriteContract, useWaitForTransactionReceipt } from "wagmi";
+import { injected } from "wagmi/connectors";
+import { parseEther, keccak256, toBytes } from "viem";
 
 import { MeshFlowMap } from "@/components/MeshFlowMap";
 import type { InsightPayload } from "@/components/WorkerInsightBubble";
@@ -12,6 +15,9 @@ import {
   type MeshPacket,
   type PacketTone,
 } from "@/lib/meshPackets";
+import { BOUNTY_ESCROW_ABI } from "@/lib/abi";
+
+const CONTRACT_ADDRESS = (process.env.NEXT_PUBLIC_CONTRACT_ADDRESS ?? "") as `0x${string}`;
 
 type NodeStatus =
   | "idle"
@@ -51,6 +57,8 @@ interface BountyCard {
   collaborating_workers?: string[];
   collaboration?: boolean;
   bids: BidEntry[];
+  deposit_tx?: string;
+  payment_tx?: string;
 }
 
 interface LogEntry {
@@ -183,6 +191,28 @@ function AuctionBountyCard({
               <span className="text-[10px] text-emerald-500/80">{b.reward}</span>
             )}
             <span className="text-[10px] text-zinc-600">{bidSummary}</span>
+            {b.deposit_tx && (
+              <a
+                href={`https://sepolia.basescan.org/tx/${b.deposit_tx}`}
+                target="_blank"
+                rel="noreferrer"
+                onClick={(e) => e.stopPropagation()}
+                className="font-mono text-[9px] text-sky-500/70 hover:text-sky-400 underline"
+              >
+                ↗ deposit
+              </a>
+            )}
+            {b.payment_tx && (
+              <a
+                href={b.payment_tx}
+                target="_blank"
+                rel="noreferrer"
+                onClick={(e) => e.stopPropagation()}
+                className="font-mono text-[9px] text-emerald-500/70 hover:text-emerald-400 underline"
+              >
+                ↗ paid
+              </a>
+            )}
           </div>
           <div className="flex shrink-0 items-center gap-2">
             <span
@@ -363,7 +393,17 @@ interface WorkerInsightBuf {
 
 export default function Home() {
   const [task, setTask] = useState("");
-  const [reward, setReward] = useState("");
+  const [rewardEth, setRewardEth] = useState("0.01");
+  const [submitting, setSubmitting] = useState(false);
+
+  // ── Wallet ────────────────────────────────────────────────────────────────
+  const { address, isConnected } = useAccount();
+  const { connect, error: connectError } = useConnect();
+  const { disconnect } = useDisconnect();
+  const { data: balance } = useBalance({ address });
+  const { writeContractAsync } = useWriteContract();
+  const [pendingTxHash, setPendingTxHash] = useState<`0x${string}` | undefined>();
+  const { isLoading: isTxConfirming } = useWaitForTransactionReceipt({ hash: pendingTxHash });
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [bounties, setBounties] = useState<BountyCard[]>([]);
   const [nodes, setNodes] = useState<Record<string, NodeState>>({
@@ -585,9 +625,9 @@ export default function Home() {
       );
     });
     es.addEventListener("bounty_posted", (e) => {
-      const { bounty_id, task: t, reward: rw } = JSON.parse(e.data);
+      const { bounty_id, task: t, reward: rw, deposit_tx } = JSON.parse(e.data);
       setBounties((prev) => [
-        { bounty_id, task: t, reward: rw ?? "", status: "PENDING", bids: [] },
+        { bounty_id, task: t, reward: rw ?? "", status: "PENDING", bids: [], deposit_tx: deposit_tx || undefined },
         ...prev,
       ]);
       addLog(
@@ -596,6 +636,19 @@ export default function Home() {
       );
       const keys = workerKeysRef.current;
       keys.forEach((wk) => spawnTrain("emitter", wk, "amber"));
+    });
+    es.addEventListener("payment_tx", (e) => {
+      const { bounty_id, tx_url, refund } = JSON.parse(e.data) as {
+        bounty_id: string;
+        tx_url: string;
+        refund?: boolean;
+      };
+      setBounties((prev) =>
+        prev.map((b) =>
+          b.bounty_id === bounty_id ? { ...b, payment_tx: tx_url } : b,
+        ),
+      );
+      addLog(refund ? "exp" : "done", `⛓ ${refund ? "Refund" : "Payment"} TX: ${tx_url.slice(-16)}…`);
     });
     es.addEventListener("worker_claimed", (e) => {
       const { bounty_id, specialty, node_key } = JSON.parse(e.data);
@@ -759,20 +812,56 @@ export default function Home() {
     return () => es.close();
   }, [spawnTrain, flashNode]);
 
-  const submitBounty = async (e: React.FormEvent, overrideTask?: string) => {
+  const submitBounty = async (e: React.FormEvent, overrideTask?: string, overrideRewardEth?: string) => {
     e.preventDefault();
     const t = overrideTask ?? task;
+    const ethAmount = overrideRewardEth ?? rewardEth;
     if (!t.trim()) return;
-    await fetch(`${API}/api/bounty`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ task: t, reward }),
-    });
-    if (!overrideTask) setTask("");
+    setSubmitting(true);
+    try {
+      // Generate bounty_id upfront so contract + backend agree
+      const bountyId = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
+      const bountyIdBytes32 = keccak256(toBytes(bountyId));
+      const rewardWei = parseEther(ethAmount || "0");
+
+      let txHash = "";
+      let posterAddress = "";
+
+      if (isConnected && address && CONTRACT_ADDRESS && rewardWei > BigInt(0)) {
+        const hash = await writeContractAsync({
+          address: CONTRACT_ADDRESS,
+          abi: BOUNTY_ESCROW_ABI,
+          functionName: "postBounty",
+          args: [bountyIdBytes32],
+          value: rewardWei,
+        });
+        txHash = hash;
+        posterAddress = address;
+        setPendingTxHash(hash);
+      }
+
+      await fetch(`${API}/api/bounty`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          task: t,
+          reward: `${ethAmount} ETH`,
+          reward_wei: Number(rewardWei),
+          tx_hash: txHash,
+          poster_address: posterAddress,
+          bounty_id: bountyId,
+        }),
+      });
+      if (!overrideTask) setTask("");
+    } catch (err) {
+      console.error("submitBounty error:", err);
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   const repostBounty = (b: BountyCard) =>
-    submitBounty({ preventDefault: () => {} } as React.FormEvent, b.task);
+    submitBounty({ preventDefault: () => {} } as React.FormEvent, b.task, rewardEth);
 
   return (
     <div className="h-screen w-screen overflow-hidden bg-[#080809] text-zinc-100">
@@ -795,9 +884,34 @@ export default function Home() {
           <span className="text-sm text-emerald-500">⬡</span>
           <span className="font-display text-sm font-semibold tracking-tight">AgenC</span>
         </div>
-        <div className="flex items-center gap-1.5">
-          <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-500" />
-          <span className="font-mono text-[10px] uppercase tracking-wider text-zinc-500">live</span>
+        <div className="flex items-center gap-3">
+          {isConnected && address ? (
+            <button
+              type="button"
+              onClick={() => disconnect()}
+              className="flex items-center gap-1.5 rounded-lg border border-zinc-800/60 bg-zinc-900/80 px-3 py-1 text-[10px] font-mono text-zinc-300 transition-colors hover:border-zinc-700 hover:text-zinc-100"
+            >
+              <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+              {address.slice(0, 6)}…{address.slice(-4)}
+              {balance && (
+                <span className="text-zinc-500">· {parseFloat(balance.formatted).toFixed(4)} ETH</span>
+              )}
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => connect({ connector: injected() })}
+              className="flex items-center gap-1.5 rounded-lg border border-zinc-700/60 bg-zinc-900/80 px-3 py-1 text-[10px] font-mono text-zinc-400 transition-colors hover:border-emerald-500/40 hover:text-emerald-400"
+              title={connectError?.message}
+            >
+              <span className="h-1.5 w-1.5 rounded-full bg-zinc-600" />
+              {connectError ? "⚠ " + connectError.message.slice(0, 30) : "Connect Wallet"}
+            </button>
+          )}
+          <div className="flex items-center gap-1.5">
+            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-500" />
+            <span className="font-mono text-[10px] uppercase tracking-wider text-zinc-500">live</span>
+          </div>
         </div>
       </header>
 
@@ -830,21 +944,34 @@ export default function Home() {
               required
             />
             <div className="flex gap-2">
-              <input
-                type="text"
-                className="flex-1 rounded-xl border border-zinc-800/60 bg-zinc-950/60 px-4 py-2.5 text-sm text-zinc-100 placeholder-zinc-700 transition-colors focus:border-zinc-600 focus:outline-none"
-                value={reward}
-                onChange={(e) => setReward(e.target.value)}
-                placeholder="Reward (e.g. 100 usdt)"
-                required
-              />
+              <div className="relative flex-1">
+                <input
+                  type="number"
+                  step="0.001"
+                  min="0.001"
+                  className="w-full rounded-xl border border-zinc-800/60 bg-zinc-950/60 px-4 py-2.5 pr-14 text-sm text-zinc-100 placeholder-zinc-700 transition-colors focus:border-zinc-600 focus:outline-none"
+                  value={rewardEth}
+                  onChange={(e) => setRewardEth(e.target.value)}
+                  placeholder="0.01"
+                  required
+                />
+                <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 font-mono text-[10px] text-zinc-500">
+                  ETH
+                </span>
+              </div>
               <button
                 type="submit"
-                className="shrink-0 rounded-xl bg-emerald-500 px-5 py-2.5 text-sm font-semibold text-zinc-950 transition-colors hover:bg-emerald-400 active:bg-emerald-600"
+                disabled={submitting || isTxConfirming}
+                className="shrink-0 rounded-xl bg-emerald-500 px-5 py-2.5 text-sm font-semibold text-zinc-950 transition-colors hover:bg-emerald-400 active:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                Broadcast
+                {submitting || isTxConfirming ? "…" : isConnected ? "⛓ Broadcast" : "Broadcast"}
               </button>
             </div>
+            {!isConnected && (
+              <p className="text-center text-[10px] text-zinc-600">
+                Connect wallet to pay bounty on-chain · or broadcast off-chain without wallet
+              </p>
+            )}
           </form>
         </div>
       </div>

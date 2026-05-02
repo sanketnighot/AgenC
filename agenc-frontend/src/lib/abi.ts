@@ -1,0 +1,86 @@
+export const BOUNTY_ESCROW_ABI = [
+  {
+    "inputs": [{ "internalType": "address", "name": "_arbiter", "type": "address" }],
+    "stateMutability": "nonpayable",
+    "type": "constructor"
+  },
+  { "inputs": [], "name": "AlreadyExists", "type": "error" },
+  { "inputs": [], "name": "AlreadySettled", "type": "error" },
+  { "inputs": [], "name": "ExceedsAmount", "type": "error" },
+  { "inputs": [], "name": "LengthMismatch", "type": "error" },
+  { "inputs": [], "name": "NotArbiter", "type": "error" },
+  { "inputs": [], "name": "ZeroValue", "type": "error" },
+  {
+    "anonymous": false,
+    "inputs": [
+      { "indexed": true, "internalType": "bytes32", "name": "bountyId", "type": "bytes32" },
+      { "indexed": false, "internalType": "address[]", "name": "workers", "type": "address[]" },
+      { "indexed": false, "internalType": "uint256[]", "name": "amounts", "type": "uint256[]" }
+    ],
+    "name": "BountyCompleted",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      { "indexed": true, "internalType": "bytes32", "name": "bountyId", "type": "bytes32" },
+      { "indexed": false, "internalType": "address", "name": "poster", "type": "address" },
+      { "indexed": false, "internalType": "uint256", "name": "amount", "type": "uint256" }
+    ],
+    "name": "BountyPosted",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      { "indexed": true, "internalType": "bytes32", "name": "bountyId", "type": "bytes32" },
+      { "indexed": false, "internalType": "address", "name": "poster", "type": "address" },
+      { "indexed": false, "internalType": "uint256", "name": "amount", "type": "uint256" }
+    ],
+    "name": "BountyRefunded",
+    "type": "event"
+  },
+  {
+    "inputs": [],
+    "name": "arbiter",
+    "outputs": [{ "internalType": "address", "name": "", "type": "address" }],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [{ "internalType": "bytes32", "name": "", "type": "bytes32" }],
+    "name": "bounties",
+    "outputs": [
+      { "internalType": "address payable", "name": "poster", "type": "address" },
+      { "internalType": "uint256", "name": "amount", "type": "uint256" },
+      { "internalType": "bool", "name": "settled", "type": "bool" }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      { "internalType": "bytes32", "name": "bountyId", "type": "bytes32" },
+      { "internalType": "address payable[]", "name": "workers", "type": "address[]" },
+      { "internalType": "uint256[]", "name": "amounts", "type": "uint256[]" }
+    ],
+    "name": "distribute",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [{ "internalType": "bytes32", "name": "bountyId", "type": "bytes32" }],
+    "name": "postBounty",
+    "outputs": [],
+    "stateMutability": "payable",
+    "type": "function"
+  },
+  {
+    "inputs": [{ "internalType": "bytes32", "name": "bountyId", "type": "bytes32" }],
+    "name": "refund",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  }
+] as const;

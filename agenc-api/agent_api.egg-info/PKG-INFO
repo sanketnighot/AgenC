@@ -10,5 +10,7 @@ Requires-Dist: pydantic>=2.13.3
 Requires-Dist: python-dotenv>=1.0.0
 Requires-Dist: requests>=2.33.1
 Requires-Dist: uvicorn>=0.46.0
+Requires-Dist: web3>=7.0
+Requires-Dist: py-solc-x>=1.1
 Provides-Extra: dev
 Requires-Dist: pytest>=8.0.0; extra == "dev"

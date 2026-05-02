@@ -53,6 +53,7 @@ _load_env(Path(__file__).parent / ".env")
 WORKER_API   = "http://127.0.0.1:8002"
 OWN_NODE_KEY = "worker_1"
 MOCK_MODE    = os.environ.get("MOCK_MODE", "false").lower() in ("1", "true", "yes")
+ETH_ADDRESS  = os.environ.get("WORKER1_ETH_ADDRESS", "")
 
 # ── LLM provider ──────────────────────────────────────────────────────────────
 
@@ -507,6 +508,7 @@ async def handle_new_bounty(from_peer: str, payload: dict) -> None:
                 "claim_rationale": ev["claim_rationale"],
                 "confidence": "high",
                 "capabilities": CAPABILITIES,
+                "eth_address": ETH_ADDRESS,
             })
             if not ok:
                 logger.warning("[send_fail] CLAIM not delivered for #%s", bounty_id)
