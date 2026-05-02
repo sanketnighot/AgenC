@@ -373,8 +373,13 @@ async def handle_collaboration(payload: dict, fallback_emitter_peer_id: str) -> 
     )
 
     collab_prompt = SYSTEM_PROMPT + (
-        f"\nIMPORTANT: Other specialists ({', '.join(peer_specialties)}) are also handling "
-        f"this task. Focus EXCLUSIVELY on your {SPECIALTY} domain."
+        f"\nIMPORTANT: You are the LEAD in a collaboration with {', '.join(peer_specialties)}. "
+        f"Focus EXCLUSIVELY on your {SPECIALTY} domain: gather all data using your tools "
+        f"(market_price_usd, uniswap_v3_pool_snapshot, web_search). "
+        f"After gathering data, you MUST store your key findings in shared memory using "
+        f"shared_memory_put so your collaborators can use them. "
+        f"Use clear keys like 'defi_tvl_data', 'eth_price', 'uniswap_pools', 'research_summary'. "
+        f"Do NOT skip the tool calls — your collaborators are waiting for this data."
     )
 
     try:
