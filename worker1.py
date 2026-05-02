@@ -23,6 +23,8 @@ from worker_tools.base import ToolContext
 from worker_tools.local_registry import capability_manifest_for, tools_for_data_analyst
 from worker_tools.runtime import run_agent_with_tools
 
+from worker_image_merge import merge_bounty_images
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -287,6 +289,17 @@ def merge_results(
     return "\n\n".join([my_result] + peer_results)
 
 
+def _collab_share_from_payload(payload: dict) -> dict:
+    """Normalize COLLAB_SHARE body (text + optional embedded images)."""
+    r = payload.get("result", "")
+    if not isinstance(r, str):
+        r = str(r) if r is not None else ""
+    imgs = payload.get("images")
+    if not isinstance(imgs, list):
+        imgs = []
+    return {"result": r, "images": imgs}
+
+
 # ── Message router ────────────────────────────────────────────────────────────
 
 class MessageRouter:
@@ -300,7 +313,7 @@ class MessageRouter:
         self._decisions: dict[str, asyncio.Future] = {}
         self._collab_shares: dict[str, asyncio.Queue] = {}
         # Buffer shares that arrive before the lead registers its queue
-        self._share_buffer: dict[str, list[str]] = {}
+        self._share_buffer: dict[str, list[dict]] = {}
 
     def register_decision(self, bounty_id: str) -> asyncio.Future:
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
@@ -313,6 +326,8 @@ class MessageRouter:
     def register_collab_shares(self, bounty_id: str) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue()
         for buffered in self._share_buffer.pop(bounty_id, []):
+            if isinstance(buffered, str):
+                buffered = {"result": buffered, "images": []}
             q.put_nowait(buffered)
         self._collab_shares[bounty_id] = q
         return q
@@ -330,13 +345,12 @@ class MessageRouter:
                 return True
 
         elif msg_type == "COLLAB_SHARE":
+            share = _collab_share_from_payload(payload)
             q = self._collab_shares.get(bounty_id)
             if q is not None:
-                q.put_nowait(payload.get("result", ""))
+                q.put_nowait(share)
             else:
-                self._share_buffer.setdefault(bounty_id, []).append(
-                    payload.get("result", "")
-                )
+                self._share_buffer.setdefault(bounty_id, []).append(share)
             return True
 
         return False
@@ -399,12 +413,19 @@ async def handle_collaboration(payload: dict, fallback_emitter_peer_id: str) -> 
         share_queue = router.register_collab_shares(bounty_id)
         peer_results: list[str] = []
         peer_specialties_received: list[str] = []
+        peer_image_lists: list[list[dict[str, str]]] = []
 
         try:
             for pw in peer_workers:
                 try:
-                    result = await asyncio.wait_for(share_queue.get(), timeout=90.0)
-                    peer_results.append(result)
+                    share = await asyncio.wait_for(share_queue.get(), timeout=150.0)
+                    if isinstance(share, str):
+                        share = {"result": share, "images": []}
+                    peer_results.append(share["result"])
+                    imgs = share.get("images")
+                    peer_image_lists.append(
+                        imgs if isinstance(imgs, list) else []
+                    )
                     peer_specialties_received.append(pw["specialty"])
                     logger.info("[collab] Received share from %s", pw["specialty"])
                 except asyncio.TimeoutError:
@@ -434,14 +455,18 @@ async def handle_collaboration(payload: dict, fallback_emitter_peer_id: str) -> 
             final = my_result
 
         all_specialties = [SPECIALTY] + peer_specialties_received
-        ok = await loop.run_in_executor(None, axl_send, emitter_peer_id, {
+        payload_done = {
             "type": "COMPLETED_BOUNTY",
             "bounty_id": bounty_id,
             "result": final,
             "specialty": " + ".join(all_specialties),
             "collaboration": True,
             "collaborators": all_specialties,
-        })
+        }
+        merged_imgs = merge_bounty_images([], *peer_image_lists)
+        if merged_imgs:
+            payload_done["images"] = merged_imgs
+        ok = await loop.run_in_executor(None, axl_send, emitter_peer_id, payload_done)
         if not ok:
             logger.warning("[send_fail] COMPLETED_BOUNTY for #%s", bounty_id)
         else:

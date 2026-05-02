@@ -3,6 +3,7 @@ arbiter.py
 config.py
 main.py
 pyproject.toml
+reputation.py
 agent_api.egg-info/PKG-INFO
 agent_api.egg-info/SOURCES.txt
 agent_api.egg-info/dependency_links.txt

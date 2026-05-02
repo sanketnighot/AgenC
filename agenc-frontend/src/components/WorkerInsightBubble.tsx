@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 
 export interface InsightPayload {
   toolText: string;
@@ -25,6 +25,59 @@ function phasePretty(phase: string): string {
     default:
       return phase;
   }
+}
+
+/** Renders model stream: text plus optional markdown images (data URLs or path placeholders). */
+function ModelStreamBody({ text }: { text: string }) {
+  const nodes: ReactNode[] = [];
+  const re = /!\[([^\]]*)\]\(([^)]+)\)/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  let key = 0;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) {
+      nodes.push(
+        <span key={`t${key++}`} className="whitespace-pre-wrap break-words">
+          {text.slice(last, m.index)}
+        </span>,
+      );
+    }
+    const alt = m[1];
+    const src = m[2].trim();
+    if (src.startsWith("data:image")) {
+      nodes.push(
+        <img
+          key={`img${key++}`}
+          src={src}
+          alt={alt || "Generated"}
+          className="mt-1 max-h-40 w-auto rounded-lg border border-zinc-700/80"
+        />,
+      );
+    } else {
+      nodes.push(
+        <span
+          key={`note${key++}`}
+          className="my-1 block rounded border border-emerald-500/25 bg-emerald-500/5 px-2 py-1.5 text-[10px] leading-snug text-emerald-200/85"
+        >
+          Generated image — open the bounty card for preview (stream cannot load{" "}
+          <code className="break-all font-mono text-[9px] text-zinc-400">{src}</code>
+          ).
+        </span>,
+      );
+    }
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) {
+    nodes.push(
+      <span key={`t${key++}`} className="whitespace-pre-wrap break-words">
+        {text.slice(last)}
+      </span>,
+    );
+  }
+  if (nodes.length === 0) {
+    return <span className="whitespace-pre-wrap break-words">{text}</span>;
+  }
+  return <div className="space-y-2">{nodes}</div>;
 }
 
 function StreamCursor({ reducedMotion }: { reducedMotion: boolean }) {
@@ -233,7 +286,7 @@ export function WorkerInsightBubble({
               >
                 {hasModel ? (
                   <>
-                    <span className="whitespace-pre-wrap break-words">{modelText}</span>
+                    <ModelStreamBody text={modelText} />
                     <StreamCursor reducedMotion={reducedMotion} />
                     <div ref={modelEndRef} />
                   </>

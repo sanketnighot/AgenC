@@ -46,3 +46,6 @@ scratchpad.txt
 # logs
 *.log
 artifacts/
+
+# Bridge runtime state (restored on startup)
+agenc-api/bounties_persist.json

@@ -25,6 +25,8 @@ from worker_tools.base import ToolContext
 from worker_tools.local_registry import capability_manifest_for, tools_for_creative_strategist
 from worker_tools.runtime import run_agent_with_tools
 
+from worker_image_merge import merge_bounty_images
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -86,6 +88,72 @@ def _images_from_artifact_paths(
     return out
 
 
+def _harvest_bounty_artifact_dir(ctx: ToolContext, bounty_id: str | None) -> None:
+    """Attach any PNGs already saved under artifacts/images/<bounty_id>/ (race-safe)."""
+    if not bounty_id:
+        return
+    try:
+        from worker_tools import gemini_image as gi
+    except ImportError:
+        return
+    root = gi.ARTIFACTS_DIR / bounty_id.replace("/", "_")
+    if not root.is_dir():
+        return
+    for p in sorted(root.glob("*.png")):
+        ps = str(p.resolve())
+        if ps not in ctx.artifact_paths:
+            ctx.artifact_paths.append(ps)
+
+
+def _embed_artifacts_with_retry(
+    ctx: ToolContext,
+    *,
+    attempts: int = 80,
+    delay_sec: float = 0.25,
+) -> list[dict[str, str]]:
+    """Poll disk briefly — artifact write may lag behind tool return in rare cases."""
+    import time
+
+    for _ in range(attempts):
+        imgs = _images_from_artifact_paths(ctx.artifact_paths)
+        if imgs:
+            return imgs
+        if not ctx.artifact_paths:
+            break
+        time.sleep(delay_sec)
+    return _images_from_artifact_paths(ctx.artifact_paths)
+
+
+def _finalize_task_output(text: str, ctx: ToolContext, bounty_id: str | None) -> TaskOutput:
+    _harvest_bounty_artifact_dir(ctx, bounty_id)
+    imgs = _embed_artifacts_with_retry(ctx)
+    return TaskOutput(text=text, images=imgs)
+
+
+def _task_output_from_timeout(bounty_id: str | None, message: str) -> TaskOutput:
+    """If wait_for fires while the model still wrote images to disk, attach them anyway."""
+    ctx = ToolContext(
+        node_key=OWN_NODE_KEY,
+        bounty_id=bounty_id,
+        stream_id=None,
+        worker_api_base=WORKER_API,
+    )
+    _harvest_bounty_artifact_dir(ctx, bounty_id)
+    imgs = _embed_artifacts_with_retry(ctx, attempts=120, delay_sec=0.25)
+    if imgs:
+        logger.warning(
+            "[timeout] recovered %s on-disk image(s) for bounty %s",
+            len(imgs),
+            bounty_id,
+        )
+        text = (
+            f"{message}\n\n"
+            "(A partial image was recovered from the worker after the run timed out.)"
+        )
+        return TaskOutput(text=text, images=imgs)
+    return TaskOutput(text=message, images=[])
+
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 def _load_env(path: Path) -> None:
@@ -109,6 +177,10 @@ WORKER_API   = "http://127.0.0.1:8003"
 OWN_NODE_KEY = "worker_2"
 MOCK_MODE    = os.environ.get("MOCK_MODE", "false").lower() in ("1", "true", "yes")
 ETH_ADDRESS  = os.environ.get("WORKER2_ETH_ADDRESS", "")
+# Whole-task executor budget (image gen + multi-turn tools often exceeds 90s).
+_EXECUTOR_TASK_TIMEOUT = float(os.environ.get("WORKER_EXECUTOR_TIMEOUT_SEC", "300"))
+# Single chat.completions call inside the tool loop (Gemini image round-trip).
+_AGENT_LLM_CALL_TIMEOUT = float(os.environ.get("WORKER_AGENT_LLM_TIMEOUT_SEC", "240"))
 
 # ── LLM provider ──────────────────────────────────────────────────────────────
 
@@ -287,12 +359,11 @@ def process_task_with_prompt(
         ctx=ctx,
         mock_mode=False,
         max_tokens=1500,
-        timeout=120.0,
+        timeout=_AGENT_LLM_CALL_TIMEOUT,
     )
     if not text.strip():
         return TaskOutput(text="AI Execution Error: empty response", images=[])
-    imgs = _images_from_artifact_paths(ctx.artifact_paths)
-    return TaskOutput(text=text, images=imgs)
+    return _finalize_task_output(text, ctx, bounty_id)
 
 
 def process_task(task: str, bounty_id: str | None = None) -> TaskOutput:
@@ -346,6 +417,17 @@ def merge_results(
 
 # ── Message router ────────────────────────────────────────────────────────────
 
+def _collab_share_from_payload(payload: dict) -> dict:
+    """Normalize COLLAB_SHARE body (text + optional embedded images)."""
+    r = payload.get("result", "")
+    if not isinstance(r, str):
+        r = str(r) if r is not None else ""
+    imgs = payload.get("images")
+    if not isinstance(imgs, list):
+        imgs = []
+    return {"result": r, "images": imgs}
+
+
 class MessageRouter:
     """Routes inbound AXL messages to coroutines waiting on them by bounty_id.
 
@@ -357,7 +439,7 @@ class MessageRouter:
         self._decisions: dict[str, asyncio.Future] = {}
         self._collab_shares: dict[str, asyncio.Queue] = {}
         # Buffer shares that arrive before the lead registers its queue
-        self._share_buffer: dict[str, list[str]] = {}
+        self._share_buffer: dict[str, list[dict]] = {}
 
     def register_decision(self, bounty_id: str) -> asyncio.Future:
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
@@ -370,6 +452,8 @@ class MessageRouter:
     def register_collab_shares(self, bounty_id: str) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue()
         for buffered in self._share_buffer.pop(bounty_id, []):
+            if isinstance(buffered, str):
+                buffered = {"result": buffered, "images": []}
             q.put_nowait(buffered)
         self._collab_shares[bounty_id] = q
         return q
@@ -387,13 +471,12 @@ class MessageRouter:
                 return True
 
         elif msg_type == "COLLAB_SHARE":
+            share = _collab_share_from_payload(payload)
             q = self._collab_shares.get(bounty_id)
             if q is not None:
-                q.put_nowait(payload.get("result", ""))
+                q.put_nowait(share)
             else:
-                self._share_buffer.setdefault(bounty_id, []).append(
-                    payload.get("result", "")
-                )
+                self._share_buffer.setdefault(bounty_id, []).append(share)
             return True
 
         return False
@@ -444,16 +527,22 @@ async def handle_collaboration(payload: dict, fallback_emitter_peer_id: str) -> 
             f"Do NOT just describe what you will do — actually call the tools now."
         )
 
+    # Non-lead waits for lead to finish gathering data and writing to shared memory
+    if not is_lead:
+        await asyncio.sleep(20)
+
     try:
         my_out = await asyncio.wait_for(
             loop.run_in_executor(
                 None,
                 lambda: process_task_with_prompt(task, collab_prompt, bounty_id),
             ),
-            timeout=90.0,
+            timeout=_EXECUTOR_TASK_TIMEOUT,
         )
     except asyncio.TimeoutError:
-        my_out = TaskOutput(text=f"{SPECIALTY} task execution timed out.", images=[])
+        my_out = _task_output_from_timeout(
+            bounty_id, f"{SPECIALTY} task execution timed out."
+        )
     logger.info("[collab] My result: %s…", my_out.text[:60])
 
     if is_lead:
@@ -461,11 +550,18 @@ async def handle_collaboration(payload: dict, fallback_emitter_peer_id: str) -> 
         peer_results: list[str] = []
         peer_specialties_received: list[str] = []
 
+        peer_image_lists: list[list[dict[str, str]]] = []
         try:
             for pw in peer_workers:
                 try:
-                    result = await asyncio.wait_for(share_queue.get(), timeout=90.0)
-                    peer_results.append(result)
+                    share = await asyncio.wait_for(share_queue.get(), timeout=90.0)
+                    if isinstance(share, str):
+                        share = {"result": share, "images": []}
+                    peer_results.append(share["result"])
+                    imgs = share.get("images")
+                    peer_image_lists.append(
+                        imgs if isinstance(imgs, list) else []
+                    )
                     peer_specialties_received.append(pw["specialty"])
                     logger.info("[collab] Received share from %s", pw["specialty"])
                 except asyncio.TimeoutError:
@@ -487,7 +583,7 @@ async def handle_collaboration(payload: dict, fallback_emitter_peer_id: str) -> 
                             bounty_id,
                         ),
                     ),
-                    timeout=90.0,
+                    timeout=120.0,
                 )
             except asyncio.TimeoutError:
                 final = "\n\n".join([my_out.text] + peer_results)
@@ -503,13 +599,16 @@ async def handle_collaboration(payload: dict, fallback_emitter_peer_id: str) -> 
             "collaboration": True,
             "collaborators": all_specialties,
         }
-        if my_out.images:
-            payload_done["images"] = my_out.images
+        merged_imgs = merge_bounty_images(my_out.images, *peer_image_lists)
+        if merged_imgs:
+            payload_done["images"] = merged_imgs
         ok = await loop.run_in_executor(None, axl_send, emitter_peer_id, payload_done)
         if not ok:
             logger.warning("[send_fail] COMPLETED_BOUNTY for #%s", bounty_id)
         else:
             logger.info("[collab] Merged result sent: %s…", final[:80])
+            if not merged_imgs:
+                asyncio.create_task(_maybe_send_late_bounty_images(emitter_peer_id, bounty_id))
 
     else:
         target_peer_id = lead_peer_id or next(
@@ -519,12 +618,15 @@ async def handle_collaboration(payload: dict, fallback_emitter_peer_id: str) -> 
         if not target_peer_id:
             logger.warning("[collab] No lead peer_id — COLLAB_SHARE cannot be delivered")
 
-        ok = await loop.run_in_executor(None, axl_send, target_peer_id, {
+        share_payload: dict = {
             "type": "COLLAB_SHARE",
             "bounty_id": bounty_id,
             "result": my_out.text,
             "specialty": SPECIALTY,
-        })
+        }
+        if my_out.images:
+            share_payload["images"] = my_out.images
+        ok = await loop.run_in_executor(None, axl_send, target_peer_id, share_payload)
         if not ok:
             logger.warning("[send_fail] COLLAB_SHARE to lead for #%s", bounty_id)
         else:
@@ -595,10 +697,10 @@ async def handle_new_bounty(from_peer: str, payload: dict) -> None:
             try:
                 out = await asyncio.wait_for(
                     loop.run_in_executor(None, process_task, task, bounty_id),
-                    timeout=90.0,
+                    timeout=_EXECUTOR_TASK_TIMEOUT,
                 )
             except asyncio.TimeoutError:
-                out = TaskOutput(text="Task execution timed out.", images=[])
+                out = _task_output_from_timeout(bounty_id, "Task execution timed out.")
             payload_cb = {
                 "type": "COMPLETED_BOUNTY",
                 "bounty_id": bounty_id,
@@ -611,6 +713,8 @@ async def handle_new_bounty(from_peer: str, payload: dict) -> None:
             ok = await loop.run_in_executor(None, axl_send, from_peer, payload_cb)
             if not ok:
                 logger.warning("[send_fail] COMPLETED_BOUNTY for #%s", bounty_id)
+            elif not payload_cb.get("images"):
+                asyncio.create_task(_maybe_send_late_bounty_images(from_peer, bounty_id))
             logger.info("[done]   #%s: %s…", bounty_id, out.text[:80])
 
         elif decision == "COLLAB_AWARD":
@@ -621,6 +725,32 @@ async def handle_new_bounty(from_peer: str, payload: dict) -> None:
 
     except Exception as e:
         logger.error("[error] handle_new_bounty #%s: %s", bounty_id, e, exc_info=True)
+
+
+async def _maybe_send_late_bounty_images(emitter_peer: str, bounty_id: str) -> None:
+    """Emit a second COMPLETED_BOUNTY with images if files landed after the first send."""
+    await asyncio.sleep(12.0)
+    ctx = ToolContext(
+        node_key=OWN_NODE_KEY,
+        bounty_id=bounty_id,
+        stream_id=None,
+        worker_api_base=WORKER_API,
+    )
+    _harvest_bounty_artifact_dir(ctx, bounty_id)
+    imgs = _embed_artifacts_with_retry(ctx)
+    if not imgs:
+        return
+    payload = {
+        "type": "COMPLETED_BOUNTY",
+        "bounty_id": bounty_id,
+        "result": "",
+        "specialty": SPECIALTY,
+        "images": imgs,
+    }
+    loop = asyncio.get_event_loop()
+    ok = await loop.run_in_executor(None, axl_send, emitter_peer, payload)
+    if ok:
+        logger.info("[late_images] supplemental COMPLETED_BOUNTY (%s images) #%s", len(imgs), bounty_id)
 
 
 # ── Recv loop ─────────────────────────────────────────────────────────────────

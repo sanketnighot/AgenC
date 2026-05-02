@@ -52,3 +52,15 @@ ARBITER_HEURISTIC_COLLAB = (
 # Worker → bridge LLM telemetry (SSE fan-out to dashboard)
 BRIDGE_TELEMETRY_SECRET = os.environ.get("BRIDGE_TELEMETRY_SECRET", "").strip()
 MAX_TELEMETRY_DELTA_BYTES = int(os.environ.get("MAX_TELEMETRY_DELTA", "8192"))
+
+# Bounty state persistence (shareable URLs survive bridge restart)
+BOUNTIES_FILE = os.environ.get(
+    "BOUNTIES_FILE",
+    str(Path(__file__).parent / "bounties_persist.json"),
+)
+
+# Mapping node_key → ETH address for on-chain reputation lookup
+WORKER_ETH_ADDRESSES: dict[str, str] = {
+    "worker_1": os.environ.get("WORKER1_ETH_ADDRESS", "").strip().lower(),
+    "worker_2": os.environ.get("WORKER2_ETH_ADDRESS", "").strip().lower(),
+}

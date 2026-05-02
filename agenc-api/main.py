@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import pathlib
 import time
 import uuid
 from typing import AsyncGenerator
@@ -16,11 +17,15 @@ from arbiter import normalize_fit_score, resolve_winner
 from payment import refund_bounty, settle_bounty
 from config import (
     ARBITER_SKIP_WHEN_UNANIMOUS,
+    BOUNTIES_FILE,
     BOUNTY_PENDING_MAX_SEC,
     CLAIM_WINDOW_SEC,
     COLLAB_TIMEOUT_SEC,
     NO_CLAIM_AFTER_BROADCAST_SEC,
+    WORKER_ETH_ADDRESSES,
 )
+from reputation import get_cache as get_reputation_cache
+from reputation import refresh_reputation
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +102,50 @@ PEER_ID_FULL_TO_NODE = {
 }
 
 bounty_locks: dict[str, asyncio.Lock] = {}
+
+
+def _save_bounties() -> None:
+    try:
+        pathlib.Path(BOUNTIES_FILE).write_text(json.dumps(bounties, default=str))
+    except Exception as e:
+        logger.warning("save_bounties failed: %s", e)
+
+
+def _merge_image_payloads(
+    existing: list,
+    new_images: list,
+    *,
+    max_images: int = 12,
+) -> list:
+    """Dedupe-merge bounty image dicts when a worker sends a supplemental COMPLETED_BOUNTY."""
+    out: list = []
+    seen: set[str] = set()
+    for group in (existing, new_images):
+        if not isinstance(group, list):
+            continue
+        for img in group:
+            if len(out) >= max_images:
+                return out
+            if not isinstance(img, dict):
+                continue
+            db = img.get("data_base64")
+            if not isinstance(db, str) or not db.strip():
+                continue
+            key = db[:240]
+            if key in seen:
+                continue
+            seen.add(key)
+            mime = img.get("mime") if isinstance(img.get("mime"), str) else "image/png"
+            out.append({"mime": mime, "data_base64": db})
+    return out
+
+
+def _load_bounties() -> None:
+    try:
+        data = json.loads(pathlib.Path(BOUNTIES_FILE).read_text())
+        bounties.update(data)
+    except Exception:
+        pass
 
 
 def _lock(bounty_id: str) -> asyncio.Lock:
@@ -233,6 +282,7 @@ async def _force_unclaimed(bounty_id: str) -> None:
                 await broadcast("payment_tx", {"bounty_id": bounty_id, "tx_url": tx_url, "refund": True})
         except Exception as exc:
             logger.error("Refund failed for bounty %s: %s", bounty_id, exc)
+    _save_bounties()
 
 
 async def _force_collab_timeout(bounty_id: str) -> None:
@@ -640,6 +690,29 @@ async def handle_inbound(from_peer: str, payload: dict) -> None:
         collaborators_payload = payload.get("collaborators", [])
         completing_node_key = resolve_node_key(from_peer)
 
+        supplement_evt: dict | None = None
+        skip_full_completion = False
+        async with _lock(bounty_id):
+            b = bounties.get(bounty_id)
+            if not b:
+                return
+            if b["status"] == "UNCLAIMED":
+                return
+            if b["status"] == "COMPLETED":
+                skip_full_completion = True
+                if isinstance(images_payload, list) and images_payload:
+                    merged_up = _merge_image_payloads(b.get("images") or [], images_payload)
+                    old = b.get("images") or []
+                    if merged_up and len(merged_up) > len(old):
+                        b["images"] = merged_up
+                        supplement_evt = {"bounty_id": bounty_id, "images": merged_up}
+                        _save_bounties()
+
+        if supplement_evt:
+            await broadcast("bounty_images_updated", supplement_evt)
+        if skip_full_completion:
+            return
+
         async with _lock(bounty_id):
             b = bounties.get(bounty_id)
             if not b or b["status"] in ("COMPLETED", "UNCLAIMED"):
@@ -716,15 +789,30 @@ async def handle_inbound(from_peer: str, payload: dict) -> None:
                     })
             except Exception as exc:
                 logger.error("Payment failed for bounty %s: %s", bounty_id, exc)
+        _save_bounties()
+
+
+async def reputation_poll_loop() -> None:
+    loop = asyncio.get_event_loop()
+    while True:
+        try:
+            await loop.run_in_executor(None, refresh_reputation)
+        except Exception as e:
+            logger.warning("reputation_poll_loop: %s", e)
+        await asyncio.sleep(300)
 
 
 @app.on_event("startup")
 async def start_background_tasks() -> None:
     global _last_mesh_json
+    _load_bounties()
     _last_mesh_json = json.dumps(build_mesh_state(), sort_keys=True)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, refresh_reputation)
     asyncio.create_task(recv_loop())
     asyncio.create_task(timeout_watcher())
     asyncio.create_task(topology_poll_loop())
+    asyncio.create_task(reputation_poll_loop())
 
 
 @app.get("/api/events")
@@ -894,6 +982,7 @@ async def broadcast_bounty(bounty: Bounty) -> dict:
         },
     )
 
+    _save_bounties()
     return {"status": "broadcasted", "bounty_id": bounty_id, "sent_to": success_count}
 
 
@@ -908,13 +997,96 @@ def get_telemetry_status() -> dict[str, bool]:
     return {"enabled": bool(config.BRIDGE_TELEMETRY_SECRET)}
 
 
+def _peer_ids_match(a: str | None, b: str | None) -> bool:
+    return str(a or "").lower() == str(b or "").lower()
+
+
+def _session_reward_wei_for_worker(bounty: dict, node_key: str, peer_id: str) -> int:
+    """Wei attributed to this worker from a completed bounty (matches settle_bounty split)."""
+    if bounty.get("status") != "COMPLETED":
+        return 0
+    reward_wei = int(bounty.get("reward_wei") or 0)
+    if reward_wei <= 0:
+        return 0
+
+    pending = bounty.get("pending_claims") or {}
+    collab_keys = list(bounty.get("collaborators") or [])
+    collab_mode = bool(bounty.get("collaboration_mode")) or len(collab_keys) > 0
+
+    if collab_mode and collab_keys:
+        worker_addrs_n = sum(
+            1
+            for c in pending.values()
+            if c.get("node_key") in collab_keys and c.get("eth_address")
+        )
+        if worker_addrs_n <= 0:
+            worker_addrs_n = len(collab_keys)
+        if worker_addrs_n <= 0 or node_key not in collab_keys:
+            return 0
+        return reward_wei // worker_addrs_n
+
+    if _peer_ids_match(bounty.get("winner_id"), peer_id):
+        return reward_wei
+    return 0
+
+
+@app.get("/api/bounties/{bounty_id}")
+def get_bounty(bounty_id: str) -> dict:
+    b = bounties.get(bounty_id)
+    if not b:
+        raise HTTPException(status_code=404, detail="Bounty not found")
+    return b
+
+
 @app.get("/api/bounties")
 def get_bounties() -> dict:
     return bounties
+
+
+@app.get("/api/reputation")
+def get_reputation() -> dict:
+    rep_cache = get_reputation_cache()
+    result: dict = {}
+    for nk, wv in WORKER_NODES.items():
+        eth_addr = WORKER_ETH_ADDRESSES.get(nk, "")
+        eth_norm = eth_addr.strip().lower() if eth_addr else ""
+        on_chain = rep_cache.get(eth_norm, {}) if eth_norm else {}
+        claimed = sum(
+            1
+            for b in bounties.values()
+            if any(
+                c.get("node_key") == nk for c in (b.get("pending_claims") or {}).values()
+            )
+        )
+        completed = sum(
+            1
+            for b in bounties.values()
+            if b.get("status") == "COMPLETED"
+            and (
+                nk in (b.get("collaborators") or [])
+                or _peer_ids_match(b.get("winner_id"), wv["peer_id"])
+            )
+        )
+        session_reward_wei = sum(
+            _session_reward_wei_for_worker(b, nk, wv["peer_id"])
+            for b in bounties.values()
+        )
+        result[nk] = {
+            "label": node_states[nk]["label"],
+            "specialty": wv["specialty"],
+            "eth_address": eth_addr,
+            "completed_onchain": on_chain.get("completed", 0),
+            "total_eth_wei": on_chain.get("total_eth_wei", 0),
+            "session_reward_wei": session_reward_wei,
+            "session_completed": completed,
+            "session_claimed": claimed,
+        }
+    return result
 
 
 @app.delete("/api/bounties")
 def clear_bounties() -> dict:
     bounties.clear()
     bounty_locks.clear()
+    _save_bounties()
     return {"status": "cleared"}

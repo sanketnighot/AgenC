@@ -49,7 +49,7 @@ def handle_gemini_generate_image(args: dict[str, Any], ctx: ToolContext) -> Tool
         },
     }
     try:
-        r = requests.post(url, params={"key": key}, json=body, timeout=120)
+        r = requests.post(url, params={"key": key}, json=body, timeout=180)
         if r.status_code != 200:
             return ToolResult(
                 False,

@@ -115,7 +115,7 @@ pytest
 ### Frontend
 
 ```bash
-cd agenc-frontend && npm install && npm run dev
+cd agenc-frontend && bun install && bun dev
 ```
 
 ---

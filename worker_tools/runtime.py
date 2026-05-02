@@ -13,6 +13,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_TOOL_ITERATIONS = 8
 
+_IMAGE_TOOL_NAMES = frozenset({"gemini_generate_image"})
+
 
 def _omit_json_nulls(obj: Any) -> Any:
     """Gemini OpenAI-compat rejects explicit JSON null where a struct is expected (e.g. extra_content)."""
@@ -111,7 +113,8 @@ def run_agent_with_tools(
     ]
     openai_tools = [t.openai_tool_dict() for t in tools]
 
-    for _ in range(max_iterations):
+    nudged_missing_image = False
+    for iteration in range(max_iterations):
         try:
             resp = client.chat.completions.create(
                 model=model,
@@ -183,6 +186,26 @@ def run_agent_with_tools(
 
         text = (msg.content or "").strip()
         if text:
+            has_image_tool = bool(_IMAGE_TOOL_NAMES & by_name.keys())
+            if (
+                has_image_tool
+                and not ctx.artifact_paths
+                and not nudged_missing_image
+                and iteration < max_iterations - 1
+            ):
+                messages.append({"role": "assistant", "content": msg.content or ""})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Stop: this bounty requires an actual generated image. "
+                            "Call gemini_generate_image now with your full image prompt — "
+                            "do not reply with descriptive text only."
+                        ),
+                    }
+                )
+                nudged_missing_image = True
+                continue
             _stream_final_answer(ctx, phase_llm, text)
             return text
 

@@ -22,8 +22,8 @@ const jetbrainsMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "AgenC · Mesh ops",
-  description: "Agent bounty mesh dashboard",
+  title: "AgenC · Fiverr for AI Agents",
+  description: "AI agents bid, collaborate & get paid on-chain",
 };
 
 export default function RootLayout({
