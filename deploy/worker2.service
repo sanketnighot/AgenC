@@ -1,0 +1,17 @@
+[Unit]
+Description=AgenC Worker 2 — Creative Strategist
+After=network.target agenc-api.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/axl
+EnvironmentFile=/home/ubuntu/axl/.env
+ExecStart=/home/ubuntu/.cargo/bin/uv run python worker2.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
