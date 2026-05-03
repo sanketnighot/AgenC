@@ -5,8 +5,8 @@ After=network.target agenc-api.service
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/root/axl
-EnvironmentFile=/root/axl/.env
+WorkingDirectory=/root/AgenC
+EnvironmentFile=/root/AgenC/.env
 ExecStart=/root/.local/bin/uv run python worker3.py
 Restart=always
 RestartSec=5
