@@ -1,6 +1,8 @@
 [Unit]
 Description=AgenC MCP web-search (DuckDuckGo via router)
-After=network.target mcp-router.service
+After=network.target
+Requires=mcp-router.service
+After=mcp-router.service
 
 [Service]
 Type=simple
