@@ -1,6 +1,6 @@
 [Unit]
 Description=AgenC Worker 2 — Creative Strategist
-After=network.target agenc-api.service
+After=network.target agenc-api.service mcp-router.service agenc-mcp-web-search.service agenc-mcp-shared-memory.service
 
 [Service]
 Type=simple

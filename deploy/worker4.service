@@ -1,6 +1,6 @@
 [Unit]
 Description=AgenC Worker 4 — Yield Scout
-After=network.target agenc-api.service axl-emitter.service axl-worker4.service
+After=network.target agenc-api.service axl-emitter.service axl-worker4.service mcp-router.service agenc-mcp-web-search.service agenc-mcp-shared-memory.service
 
 [Service]
 Type=simple

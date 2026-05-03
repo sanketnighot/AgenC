@@ -8,7 +8,7 @@ User=root
 WorkingDirectory=/root/AgenC/integrations
 ExecStart=/root/.local/bin/uv run agenc-shared-memory-mcp --host 127.0.0.1 --port 9102 --router http://127.0.0.1:9003
 Restart=always
-RestartSec=3
+RestartSec=5
 StandardOutput=journal
 StandardError=journal
 
