@@ -189,10 +189,12 @@ async def _run(args: argparse.Namespace) -> None:
     """Bind first, then register with router — avoids empty registry when bind fails."""
     endpoint = f"http://{args.host}:{args.port}/mcp"
     app = web.Application()
+    app["_mcp_registered"] = False
     app.router.add_post("/mcp", handle_mcp)
 
     async def cleanup(_app: web.Application) -> None:
-        deregister_service("shared-memory", args.router)
+        if _app.get("_mcp_registered"):
+            deregister_service("shared-memory", args.router)
 
     app.on_cleanup.append(cleanup)
 
@@ -210,6 +212,8 @@ async def _run(args: argparse.Namespace) -> None:
         logger.error("failed to register shared-memory with MCP router at %s", args.router)
         await runner.cleanup()
         raise SystemExit(1)
+
+    app["_mcp_registered"] = True
 
     logger.info("shared-memory MCP listening on %s", endpoint)
 

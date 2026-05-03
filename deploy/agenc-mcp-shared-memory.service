@@ -8,6 +8,8 @@ After=mcp-router.service
 Type=simple
 User=root
 WorkingDirectory=/root/AgenC/integrations
+# Kill stray listeners on this port (manual MCP runs / zombie PIDs) so bind does not fail with EADDRINUSE
+ExecStartPre=-/bin/sh -c 'fuser -k 9102/tcp 2>/dev/null || true; sleep 0.5'
 ExecStart=/root/.local/bin/uv run agenc-shared-memory-mcp --host 127.0.0.1 --port 9102 --router http://127.0.0.1:9003
 Restart=always
 RestartSec=5
