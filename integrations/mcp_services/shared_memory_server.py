@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import os
+import signal
 import threading
 import time
 from typing import Any
@@ -183,16 +185,9 @@ async def handle_mcp(request: web.Request) -> web.Response:
     )
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=int(os.environ.get("SHARED_MEMORY_MCP_PORT", "9102")))
-    parser.add_argument("--router", default=os.environ.get("MCP_ROUTER_URL", "http://127.0.0.1:9003"))
-    args = parser.parse_args()
-
+async def _run(args: argparse.Namespace) -> None:
+    """Bind first, then register with router — avoids empty registry when bind fails."""
     endpoint = f"http://{args.host}:{args.port}/mcp"
-    register_service("shared-memory", endpoint, args.router)
-
     app = web.Application()
     app.router.add_post("/mcp", handle_mcp)
 
@@ -201,8 +196,49 @@ def main() -> None:
 
     app.on_cleanup.append(cleanup)
 
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, args.host, args.port)
+    try:
+        await site.start()
+    except OSError as exc:
+        logger.error("bind failed on %s:%s: %s", args.host, args.port, exc)
+        await runner.cleanup()
+        raise SystemExit(1) from exc
+
+    if not register_service("shared-memory", endpoint, args.router):
+        logger.error("failed to register shared-memory with MCP router at %s", args.router)
+        await runner.cleanup()
+        raise SystemExit(1)
+
     logger.info("shared-memory MCP listening on %s", endpoint)
-    web.run_app(app, host=args.host, port=args.port)
+
+    loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
+    use_signals = True
+    try:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, stop.set)
+    except (NotImplementedError, RuntimeError, ValueError):
+        use_signals = False
+
+    try:
+        if use_signals:
+            await stop.wait()
+        else:
+            while True:
+                await asyncio.sleep(3600)
+    finally:
+        await runner.cleanup()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("SHARED_MEMORY_MCP_PORT", "9102")))
+    parser.add_argument("--router", default=os.environ.get("MCP_ROUTER_URL", "http://127.0.0.1:9003"))
+    args = parser.parse_args()
+    asyncio.run(_run(args))
 
 
 if __name__ == "__main__":
