@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from typing import AsyncGenerator
@@ -76,6 +77,43 @@ WORKER_NODES = {
             ],
             "tool_classes": ["image_generation", "creative", "web_search", "memory"],
             "supports_artifact_output": True,
+        },
+    },
+    "worker_3": {
+        "peer_id": "1619bb72cd5ca56ae2fb685af6419ed23cc89d68168510630f5e5ee239108d12",
+        "specialty": "Sentiment Analyst",
+        "api": "http://127.0.0.1:8004",
+        "capabilities": {
+            "tool_ids": [
+                "fear_greed_index",
+                "crypto_trending",
+                "global_market_overview",
+                "web_search",
+                "shared_memory_put",
+                "shared_memory_get",
+                "shared_memory_list",
+            ],
+            "tool_classes": ["sentiment", "market_data", "social", "web_search", "memory"],
+            "supports_artifact_output": False,
+        },
+    },
+    "worker_4": {
+        "peer_id": "90d3170ee3771e1b7a30b1b6a81b3aaa4730543c11634c65353aba2abc5490e3",
+        "specialty": "Yield Scout",
+        "api": "http://127.0.0.1:8005",
+        "capabilities": {
+            "tool_ids": [
+                "defi_llama_yields",
+                "aave_market_rates",
+                "protocol_tvl_ranking",
+                "market_price_usd",
+                "web_search",
+                "shared_memory_put",
+                "shared_memory_get",
+                "shared_memory_list",
+            ],
+            "tool_classes": ["yield", "defi", "market_data", "web_search", "memory"],
+            "supports_artifact_output": False,
         },
     },
 }

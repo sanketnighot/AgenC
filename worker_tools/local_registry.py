@@ -9,7 +9,9 @@ import os
 from worker_tools.base import ToolContext, ToolResult, ToolSpec
 from worker_tools.gemini_image import CREATIVE_LOCAL_TOOLS
 from worker_tools.mcp_proxy import _mcp_route_endpoint, mcp_tools_call
+from worker_tools.sentiment_tools import SENTIMENT_LOCAL_TOOLS
 from worker_tools.uniswap import DATA_ANALYST_LOCAL_TOOLS
+from worker_tools.yield_tools import YIELD_SCOUT_LOCAL_TOOLS
 
 try:
     from collab_protocol import artifact_producer_for
@@ -247,14 +249,43 @@ def tools_for_creative_strategist(worker_api_base: str) -> list[ToolSpec]:
     return tools
 
 
+def tools_for_sentiment_analyst(worker_api_base: str) -> list[ToolSpec]:
+    tools = list(SENTIMENT_LOCAL_TOOLS)
+    if _mcp_tools_enabled() or _perplexity_enabled():
+        tools.extend(_mcp_tool_specs())
+    elif worker_api_base:
+        logger.debug("MCP and Perplexity unset — web_search disabled for sentiment analyst")
+    return tools
+
+
+def tools_for_yield_scout(worker_api_base: str) -> list[ToolSpec]:
+    tools = list(YIELD_SCOUT_LOCAL_TOOLS)
+    # Yield scout also benefits from market prices for context
+    tools.extend([t for t in DATA_ANALYST_LOCAL_TOOLS if t.name == "market_price_usd"])
+    if _mcp_tools_enabled() or _perplexity_enabled():
+        tools.extend(_mcp_tool_specs())
+    elif worker_api_base:
+        logger.debug("MCP and Perplexity unset — web_search disabled for yield scout")
+    return tools
+
+
 def capability_manifest_for(role: str) -> dict:
     """Embedded into CLAIM JSON for bridge + arbiter."""
     if role == "data":
         ids = [t.name for t in DATA_ANALYST_LOCAL_TOOLS]
         classes = ["market_data", "defi", "price_feed"]
-    else:
+    elif role == "creative":
         ids = [t.name for t in CREATIVE_LOCAL_TOOLS]
         classes = ["image_generation", "creative"]
+    elif role == "sentiment":
+        ids = [t.name for t in SENTIMENT_LOCAL_TOOLS]
+        classes = ["sentiment", "market_data", "social"]
+    elif role == "yield":
+        ids = [t.name for t in YIELD_SCOUT_LOCAL_TOOLS] + ["market_price_usd"]
+        classes = ["yield", "defi", "market_data"]
+    else:
+        ids = []
+        classes = []
     if _mcp_tools_enabled() or _perplexity_enabled():
         ids.extend(["web_search", "shared_memory_put", "shared_memory_get", "shared_memory_list"])
         classes.extend(["web_search", "memory"])

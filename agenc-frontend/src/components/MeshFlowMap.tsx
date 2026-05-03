@@ -181,10 +181,17 @@ function WorkerFlowNode({ data }: NodeProps<WorkerRFNode>) {
         {data.worker.short_id}…
       </p>
       <div className="mt-1 flex items-center gap-1">
-        <span className={`h-1 w-1 rounded-full ${STATUS_DOT[data.agent.status]}`} />
-        <span className="text-[8px] font-mono uppercase tracking-wider text-emerald-500/90">
-          live
-        </span>
+        {data.worker.mesh_connected ? (
+          <>
+            <span className={`h-1 w-1 rounded-full ${STATUS_DOT[data.agent.status]}`} />
+            <span className="text-[8px] font-mono uppercase tracking-wider text-emerald-500/90">live</span>
+          </>
+        ) : (
+          <>
+            <span className="h-1 w-1 rounded-full bg-zinc-700" />
+            <span className="text-[8px] font-mono uppercase tracking-wider text-zinc-600">offline</span>
+          </>
+        )}
       </div>
     </div>
   );

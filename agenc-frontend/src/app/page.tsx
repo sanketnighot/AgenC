@@ -58,10 +58,22 @@ const TAG_COLORS: Record<string, string> = {
   web: "bg-teal-500/10 text-teal-400 border-teal-500/20",
   price: "bg-emerald-500/10 text-emerald-400 border-emerald-500/20",
   creative: "bg-fuchsia-500/10 text-fuchsia-400 border-fuchsia-500/20",
+  sentiment: "bg-orange-500/10 text-orange-400 border-orange-500/20",
+  yield: "bg-lime-500/10 text-lime-400 border-lime-500/20",
 };
+
+const TEMPLATE_CATS = [
+  { id: "all", label: "All" },
+  { id: "data", label: "Data" },
+  { id: "sentiment", label: "Mood" },
+  { id: "yield", label: "Yield" },
+  { id: "img", label: "Art" },
+  { id: "collab", label: "Collab" },
+] as const;
 
 const TEMPLATES = [
   {
+    icon: "📊",
     label: "DeFi Report",
     reward: "0.008",
     tags: ["collab", "uniswap", "web", "data"],
@@ -69,6 +81,7 @@ const TEMPLATES = [
       "Analyze the top 5 DeFi protocols by TVL using live Uniswap V3 pool data. Compare risk/reward profiles and write a 3-bullet summary for a DeFi investor.",
   },
   {
+    icon: "🎨",
     label: "Market Visual",
     reward: "0.005",
     tags: ["img", "creative"],
@@ -76,13 +89,7 @@ const TEMPLATES = [
       "Generate a bold infographic-style image showing ETH price performance vs BTC over the past month. Include vibrant colors, clear labels, and a compelling headline.",
   },
   {
-    label: "Web Research",
-    reward: "0.003",
-    tags: ["web", "data"],
-    task:
-      "Research the top 3 AI agent frameworks — LangChain, CrewAI, AutoGen — and summarize their key architectural differences in a structured comparison.",
-  },
-  {
+    icon: "💎",
     label: "ETH Price Brief",
     reward: "0.002",
     tags: ["data", "tool", "price"],
@@ -90,18 +97,60 @@ const TEMPLATES = [
       "Fetch the current ETH/USD price using live market data. Calculate 7-day percentage change and explain the top 2 catalysts driving recent movement.",
   },
   {
-    label: "Crypto Strategy",
-    reward: "0.010",
-    tags: ["collab", "img", "data", "tool"],
-    task:
-      "Create a 1-page crypto investor brief: an eye-catching market overview image AND key data metrics (price, volume, dominance) for ETH and the top 3 altcoins.",
-  },
-  {
+    icon: "🦄",
     label: "Uniswap Snapshot",
     reward: "0.004",
     tags: ["uniswap", "data", "tool"],
     task:
       "Pull current TVL and fee APR for the top 3 ETH/USDC Uniswap V3 pools. Rank them by yield and recommend which is best for a passive liquidity provider.",
+  },
+  {
+    icon: "😱",
+    label: "Fear & Greed",
+    reward: "0.002",
+    tags: ["sentiment", "data", "tool"],
+    task:
+      "Check today's Crypto Fear & Greed Index and identify the top trending coins on CoinGecko right now. Explain what the current sentiment reading means for short-term ETH price action.",
+  },
+  {
+    icon: "🌾",
+    label: "Yield Hunt",
+    reward: "0.003",
+    tags: ["yield", "data", "tool"],
+    task:
+      "Find the top 5 highest-yield DeFi pools on Ethereum right now using live DeFiLlama data. Filter for pools with at least $1M TVL and rank by total APY. Flag any with high impermanent loss risk.",
+  },
+  {
+    icon: "🏦",
+    label: "Aave Rates",
+    reward: "0.002",
+    tags: ["yield", "tool"],
+    task:
+      "Compare current Aave V3 supply APY for USDC, DAI, and WETH on Ethereum and Arbitrum. Recommend the single best passive lending position for a risk-averse stablecoin holder.",
+  },
+  {
+    icon: "🧠",
+    label: "Sentiment Report",
+    reward: "0.006",
+    tags: ["sentiment", "collab", "data", "tool"],
+    task:
+      "Combine live Fear & Greed Index, top trending coins, and ETH/BTC price data to write a 3-bullet market sentiment brief. Rate current conditions as Risk-On, Neutral, or Risk-Off with supporting evidence.",
+  },
+  {
+    icon: "🔍",
+    label: "DeFi Intel",
+    reward: "0.009",
+    tags: ["yield", "sentiment", "collab", "data"],
+    task:
+      "Comprehensive DeFi opportunity scan: find the top 3 yield pools on DeFiLlama AND assess market sentiment via Fear & Greed Index. Determine whether current crowd psychology supports or undermines entering these positions now.",
+  },
+  {
+    icon: "🚀",
+    label: "Crypto Strategy",
+    reward: "0.012",
+    tags: ["collab", "img", "sentiment", "yield"],
+    task:
+      "Create a full crypto investor brief: generate a market overview image, pull current Fear & Greed sentiment, and identify the top 2 yield opportunities on DeFi. Combine into a single actionable recommendation for a DeFi investor.",
   },
 ];
 
@@ -575,6 +624,8 @@ export default function Home() {
   const [task, setTask] = useState("");
   const [rewardEth, setRewardEth] = useState("0.01");
   const [submitting, setSubmitting] = useState(false);
+  const [selectedTpl, setSelectedTpl] = useState<string | null>(null);
+  const [catFilter, setCatFilter] = useState("all");
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
   // ── Wallet ────────────────────────────────────────────────────────────────
@@ -607,6 +658,7 @@ export default function Home() {
     logs,
     sseConnected,
     workerInsights,
+    meshWorkers,
     connectedWorkers,
     repRefreshTick,
     setRepRefreshTick,
@@ -710,7 +762,7 @@ export default function Home() {
       {/* Layer 0: Full-screen mesh canvas */}
       <MeshFlowMap
         emitter={nodes.emitter}
-        workers={connectedWorkers}
+        workers={meshWorkers}
         agentStates={nodes}
         meshPackets={meshPackets}
         selectedWorkerKey={selectedInsightWorker}
@@ -830,67 +882,123 @@ export default function Home() {
           </div>
         }
       >
-        <div className="@container flex min-h-0 flex-1 flex-col overflow-y-auto p-3 pt-0 shadow-[0_-12px_40px_-28px_rgba(16,185,129,0.12)]">
-          <form onSubmit={submitBounty} className="flex min-h-0 flex-1 flex-col gap-2">
-            <div className="grid gap-2 [grid-template-columns:repeat(auto-fill,minmax(min(100%,7rem),1fr))]">
-              {TEMPLATES.map((tpl) => (
+        <div className="@container flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto p-3 pt-0">
+          <form onSubmit={submitBounty} className="flex min-h-0 flex-1 flex-col gap-2.5">
+
+            {/* Category filter pills */}
+            <div className="flex gap-1 overflow-x-auto pb-0.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+              {TEMPLATE_CATS.map((cat) => (
                 <button
-                  key={tpl.label}
+                  key={cat.id}
                   type="button"
-                  onClick={() => {
-                    setTask(tpl.task);
-                    setRewardEth(tpl.reward);
-                  }}
-                  className="group flex min-h-[3.25rem] w-full flex-col items-start justify-center gap-1 rounded-xl border border-zinc-800/60 bg-zinc-900/80 px-2.5 py-2 text-left text-zinc-300 transition-colors hover:border-emerald-500/35 hover:text-zinc-100 @[320px]:min-h-[3.5rem] @[320px]:gap-1.5 @[320px]:px-3"
+                  onClick={() => setCatFilter(cat.id)}
+                  className={`shrink-0 rounded-full border px-2.5 py-0.5 text-[10px] font-medium transition-colors ${
+                    catFilter === cat.id
+                      ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-400"
+                      : "border-zinc-800/60 text-zinc-500 hover:border-zinc-700 hover:text-zinc-300"
+                  }`}
                 >
-                  <span className="text-xs font-semibold leading-tight text-zinc-100 @[320px]:text-[13px]">
-                    {tpl.label}
-                  </span>
-                  <span className="flex flex-wrap gap-1">
-                    {tpl.tags.map((tag) => (
-                      <span
-                        key={tag}
-                        className={`rounded-md border px-1 py-0.5 text-[9px] font-medium leading-none @[280px]:px-1.5 @[280px]:text-[10px] ${TAG_COLORS[tag] ?? ""}`}
-                      >
-                        {tag}
-                      </span>
-                    ))}
-                  </span>
+                  {cat.label}
                 </button>
               ))}
             </div>
+
+            {/* Template strip — single horizontal scrollable row */}
+            <div className="flex gap-1.5 overflow-x-auto pb-0.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+              {TEMPLATES.filter(
+                (t) => catFilter === "all" || t.tags.includes(catFilter),
+              ).map((tpl) => {
+                const active = selectedTpl === tpl.label;
+                return (
+                  <button
+                    key={tpl.label}
+                    type="button"
+                    title={tpl.task}
+                    onClick={() => {
+                      setTask(tpl.task);
+                      setRewardEth(tpl.reward);
+                      setSelectedTpl(tpl.label);
+                    }}
+                    className={`group flex w-32 shrink-0 flex-col gap-1.5 rounded-xl border px-2.5 py-2 text-left transition-all ${
+                      active
+                        ? "border-emerald-500/40 bg-emerald-500/5 shadow-[0_0_14px_-6px_rgba(16,185,129,0.35)]"
+                        : "border-zinc-800/60 bg-zinc-900/60 hover:border-zinc-700 hover:bg-zinc-900"
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-1">
+                      <span className="text-[11px] font-semibold leading-tight text-zinc-100">
+                        {tpl.label}
+                      </span>
+                    </div>
+                    <div className="mt-auto flex items-center justify-between gap-1">
+                      <div className="flex flex-wrap gap-1">
+                        {tpl.tags.slice(0, 2).map((tag) => (
+                          <span
+                            key={tag}
+                            className={`rounded border px-1 py-0.5 text-[8px] font-medium leading-none ${TAG_COLORS[tag] ?? ""}`}
+                          >
+                            {tag}
+                          </span>
+                        ))}
+                        {tpl.tags.length > 2 && (
+                          <span className="text-[8px] text-zinc-600">+{tpl.tags.length - 2}</span>
+                        )}
+                      </div>
+                      <span className="shrink-0 font-mono text-[9px] text-zinc-500">
+                        {tpl.reward}Ξ
+                      </span>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Divider */}
+            <div className="relative flex items-center gap-2">
+              <div className="h-px flex-1 bg-zinc-800/60" />
+              <span className="text-[9px] text-zinc-600">or describe your own</span>
+              <div className="h-px flex-1 bg-zinc-800/60" />
+            </div>
+
+            {/* Task textarea */}
             <textarea
-              className="max-h-[min(40vh,12rem)] min-h-[2.75rem] w-full flex-1 resize-y rounded-lg border border-zinc-800/60 bg-zinc-950/60 px-3 py-2 text-sm leading-snug text-zinc-100 placeholder-zinc-600 transition-colors focus:border-zinc-600 focus:outline-none"
+              className="max-h-[min(40vh,10rem)] min-h-[3rem] w-full flex-1 resize-y rounded-lg border border-zinc-800/60 bg-zinc-950/60 px-3 py-2 text-sm leading-snug text-zinc-100 placeholder-zinc-600 transition-colors focus:border-zinc-600 focus:outline-none"
               rows={2}
               value={task}
-              onChange={(e) => setTask(e.target.value)}
+              onChange={(e) => {
+                setTask(e.target.value);
+                if (selectedTpl) setSelectedTpl(null);
+              }}
               placeholder="Describe the task…"
               required
             />
-            <div className="flex shrink-0 flex-col gap-2 @[380px]:flex-row @[380px]:items-center @[380px]:justify-between @[380px]:gap-2">
-              <div className="relative w-full @[380px]:w-32 @[380px]:shrink-0">
+
+            {/* Bottom row: reward + submit */}
+            <div className="flex shrink-0 items-center gap-2">
+              <div className="relative w-28 shrink-0">
                 <input
                   type="number"
                   step="0.001"
                   min="0.001"
-                  className="w-full rounded-lg border border-zinc-800/60 bg-zinc-950/60 px-3 py-1.5 pr-10 text-sm text-zinc-100 transition-colors focus:border-zinc-600 focus:outline-none"
+                  className="w-full rounded-lg border border-zinc-800/60 bg-zinc-950/60 px-3 py-1.5 pr-9 text-sm text-zinc-100 transition-colors focus:border-zinc-600 focus:outline-none"
                   value={rewardEth}
                   onChange={(e) => setRewardEth(e.target.value)}
                   placeholder="0.01"
                   required
                 />
-                <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 font-mono text-[9px] text-zinc-500">
-                  ETH
+                <span className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 font-mono text-[9px] text-zinc-500">
+                  Ξ
                 </span>
               </div>
               <button
                 type="submit"
                 disabled={submitting || isTxConfirming || !walletUiReady || !isConnected}
-                className="w-full shrink-0 rounded-lg bg-emerald-500 px-4 py-1.5 text-xs font-semibold text-zinc-950 transition-colors hover:bg-emerald-400 active:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-50 @[380px]:ml-auto @[380px]:w-auto"
+                className="ml-auto w-full shrink-0 rounded-lg bg-emerald-500 px-4 py-1.5 text-xs font-semibold text-zinc-950 transition-colors hover:bg-emerald-400 active:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-50 @[380px]:w-auto"
               >
                 {submitting ? "Sending…" : isTxConfirming ? "Confirming…" : "⛓ Broadcast"}
               </button>
             </div>
+
             {(!walletUiReady || !isConnected) && (
               <p className="text-[9px] leading-tight text-amber-600/80">
                 Connect wallet to broadcast

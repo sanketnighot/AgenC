@@ -1,0 +1,17 @@
+[Unit]
+Description=AgenC Worker 4 — Yield Scout
+After=network.target agenc-api.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/axl
+EnvironmentFile=/root/axl/.env
+ExecStart=/root/.local/bin/uv run python worker4.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

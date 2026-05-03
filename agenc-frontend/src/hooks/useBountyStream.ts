@@ -116,11 +116,9 @@ export function useBountyStream(
   const [nodes, setNodes] = useState<Record<string, NodeState>>({
     emitter: { status: "idle", label: "Emitter" },
     worker_1: { status: "idle", label: "Worker 1", specialty: "Data Analyst" },
-    worker_2: {
-      status: "idle",
-      label: "Worker 2",
-      specialty: "Creative Strategist",
-    },
+    worker_2: { status: "idle", label: "Worker 2", specialty: "Creative Strategist" },
+    worker_3: { status: "idle", label: "Worker 3", specialty: "Sentiment Analyst" },
+    worker_4: { status: "idle", label: "Worker 4", specialty: "Yield Scout" },
   });
   const [meshWorkers, setMeshWorkers] = useState<MeshWorkerView[]>([]);
   const [workerInsights, setWorkerInsights] = useState<
