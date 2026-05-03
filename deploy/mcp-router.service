@@ -1,0 +1,16 @@
+[Unit]
+Description=MCP Router (routes web-search + shared-memory for AgenC workers)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/AgenC/integrations
+ExecStart=/root/.local/bin/uv run mcp-router --port 9003
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
