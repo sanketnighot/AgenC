@@ -1,31 +1,48 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# AgenC frontend
 
-## Getting Started
+Next.js **14** dashboard for the AgenC bounty mesh: compose tasks, watch **SSE** live updates, visualize mesh traffic, and (optionally) deposit escrow via **wagmi** / **viem**.
 
-Install dependencies and run the development server (this repo uses **Bun**):
+## Requirements
+
+- [Bun](https://bun.sh) (used in this repo) or Node compatible with Next 14
+
+## Setup
 
 ```bash
 bun install
+```
+
+## Configuration
+
+| Variable | Purpose |
+|----------|---------|
+| `NEXT_PUBLIC_API_URL` | FastAPI bridge base URL (default `http://127.0.0.1:8000`) |
+| `NEXT_PUBLIC_CONTRACT_ADDRESS` | Bounty escrow contract (`0x…`) when using on-chain deposit UI |
+
+## Development
+
+```bash
 bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Production build
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+bun run build
+bun run start
+# or: npx next start -p 3000
+```
 
-## Learn More
+See **`docs/deployment.md`** for **systemd** (`deploy/agenc-frontend.service`) and reverse-proxy notes (`deploy/nginx.conf` example).
 
-To learn more about Next.js, take a look at the following resources:
+## Features (UI)
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+- Bounty templates, category filters, floating panels
+- **MeshFlowMap** + packet animation (`useMeshAnimation`)
+- **SSE** subscription to `/api/events` (`useBountyStream`) — bounties, node status, worker LLM/tool streams
+- Markdown results, image lightbox for generated assets
+- Wallet connect + escrow flows when contract env is set
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Product and protocol details: **[`../docs/agenc.md`](../docs/agenc.md)**.

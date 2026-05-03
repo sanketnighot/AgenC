@@ -18,19 +18,28 @@ The node payload layer is **application-agnostic** (raw bytes, JSON, etc.). Agen
 
 ```
 cmd/node/                 # Go entrypoint and ApiConfig overrides
-api/                     # HTTP: send, recv, topology, mcp, a2a
+api/                      # HTTP: send, recv, topology, mcp, a2a
 internal/
-  tcp/listen/            # Inbound TCP, multiplexer, Stream interface
-  tcp/dial/              # Outbound peer dialing
-  mcp/                   # MCP stream
-  a2a/                   # A2A stream
-integrations/            # Python: MCP router, A2A server
-examples/python-client/  # Minimal send/recv example
-agenc-frontend/          # Next.js AgenC UI (polls backend; see frontend README)
-docs/                    # architecture, api, configuration, integrations, agenc.md
+  tcp/listen/             # Inbound TCP, multiplexer, Stream interface
+  tcp/dial/               # Outbound peer dialing
+  mcp/                    # MCP stream
+  a2a/                    # A2A stream
+agenc-api/                # FastAPI bridge (bounties, arbiter, SSE, escrow hooks)
+agenc-frontend/           # Next.js dashboard (SSE, mesh UI, wagmi)
+worker_core.py            # Shared worker recv/send + routing helpers
+worker1.py … worker4.py   # Persona workers
+worker_tools/             # Tool specs + MCP proxy + domain tools
+collab_protocol.py        # Collaboration roles / memory keys
+integrations/
+  mcp_routing/            # MCP HTTP router (:9003)
+  mcp_services/           # web-search + shared-memory MCP servers
+  a2a_serving/            # A2A optional server
+examples/python-client/   # Minimal send/recv example
+deploy/                   # systemd units, env.template, nginx sample
+docs/                     # architecture, api, configuration, integrations, agenc.md, deployment.md
 ```
 
-Expected **GStack bridge**: **FastAPI** (or equivalent) translating UI ↔ **`/send`**, **`/recv`**, **`/topology`**. The frontend in-repo currently calls **`http://127.0.0.1:8000/api/...`** — implement those routes on the bridge to match.
+The **FastAPI bridge** lives in-repo at **`agenc-api/`**. The frontend calls **`http://127.0.0.1:8000/api/...`** by default (`NEXT_PUBLIC_API_URL`).
 
 ---
 
@@ -150,6 +159,7 @@ Full reference: `docs/configuration.md`.
 | Topic | File |
 |-------|------|
 | AgenC bounty protocol, roadmap, FastAPI/UI stack | **`docs/agenc.md`** |
+| VPS / systemd / MCP sidecars | **`docs/deployment.md`** |
 | AXL internals | `docs/architecture.md`, `docs/api.md` |
 
 **Claude / other assistants:** **`CLAUDE.md`** at repo root defers here and to **`docs/agenc.md`**.

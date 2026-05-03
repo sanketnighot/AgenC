@@ -1,5 +1,7 @@
 # Examples
 
+For the **AgenC** FastAPI bridge and dashboard, see **[`docs/agenc.md`](agenc.md)** and **[`docs/deployment.md`](deployment.md)**.
+
 ## Remote MCP Server
 
 This example connects two machines over Yggdrasil so one can call MCP tools hosted on the other. A2A is **not** required — the node's `/mcp/` endpoint talks directly to a remote peer's MCP router.

@@ -5,9 +5,13 @@ The `integrations/` directory contains Python services that run alongside the Go
 ```
 integrations/
   mcp_routing/
-    mcp_router.py        # MCP request router (:9003)
+    mcp_router.py           # MCP HTTP router (:9003)
+  mcp_services/
+    web_search_server.py    # agenc-web-search-mcp (:9101)
+    shared_memory_server.py # agenc-shared-memory-mcp (:9102)
+    registration.py         # POST /register with retries (router startup races)
   a2a_serving/
-    a2a_server.py        # A2A protocol server (:9004)
+    a2a_server.py           # A2A protocol server (:9004)
   pyproject.toml
 ```
 
@@ -15,7 +19,7 @@ integrations/
 
 ```bash
 cd integrations
-pip install -e .
+uv sync    # or: pip install -e .
 ```
 
 ## MCP Router
@@ -25,8 +29,13 @@ The router is a lightweight HTTP gateway that sits between the Yggdrasil P2P bri
 Start the router before launching any MCP server:
 
 ```bash
-python -m mcp_routing.mcp_router --port 9003
+uv run mcp-router --port 9003
+# or: python -m mcp_routing.mcp_router --port 9003
 ```
+
+Sidecar servers (**bind first**, then register) retry **`POST /register`** if the router is still starting (connection errors / 5xx). On shutdown they deregister only if registration succeeded.
+
+Install **`psmisc`** on Linux if you use systemd **`fuser`** in `ExecStartPre` (see **`docs/deployment.md`**).
 
 | Endpoint | Description |
 |----------|-------------|
@@ -124,14 +133,16 @@ python examples/python-client/a2a_client.py \
 
 For hackathon demos, you can run additional **MCP HTTP services** that register with the same **`mcp_router`** used by the Go node:
 
-| Script (after `pip install -e .` in `integrations/`) | Port (default) | Service name (for `/mcp/{peer}/{service}`) |
-|--------------------------------------------------------|----------------|---------------------------------------------|
+| Script (after `uv sync` or `pip install -e .` in `integrations/`) | Port (default) | Service name (for `POST /route` or `/mcp/{peer}/{service}`) |
+|-------------------------------------------------------------------|----------------|---------------------------------------------------------------|
 | `agenc-web-search-mcp` | 9101 | `web-search` |
 | `agenc-shared-memory-mcp` | 9102 | `shared-memory` |
 
-1. Start **`python -m mcp_routing.mcp_router`** (or `mcp-router`) on **9003**.
-2. Start **`agenc-web-search-mcp`** and **`agenc-shared-memory-mcp`** — they self-register with the router.
-3. Set **`MCP_SERVICE_PEER_ID`** in worker `.env` to the **64-char hex public key** of the node where MCP traffic should land (typically the emitter). Workers invoke tools via their **local** node URL `WORKER_API`: `POST http://127.0.0.1:<node>/mcp/{MCP_SERVICE_PEER_ID}/web-search`.
+1. Start **`mcp-router`** on **9003** (see [MCP Router](#mcp-router) above).
+2. Start the sidecars — they listen on **9101** / **9102**, then register.
+3. Set **`MCP_ROUTER_HTTP=http://127.0.0.1:9003`** in the repo **`.env`** so workers use **`POST …/route`** (simplest for single-host / VPS).
+
+   **Mesh path (optional):** set **`MCP_SERVICE_PEER_ID`** to the **64-char hex** public key of the node that should receive MCP traffic, and call via the local worker node: `POST http://127.0.0.1:<api_port>/mcp/{MCP_SERVICE_PEER_ID}/web-search`.
 
 ---
 

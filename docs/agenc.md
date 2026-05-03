@@ -26,16 +26,18 @@ AgenC is built as a **zero-infrastructure** stack: developers join the mesh by r
 
 ### 2. GStack bridge
 
-- **Frontend:** Next.js app in **`agenc-frontend/`** — dashboard for posting bounties and viewing mesh-related activity (polls backend APIs).
-- **Backend:** **FastAPI** (or compatible) **bridge** — translates UI actions into AXL **`/send`**, **`/recv`**, **`/topology`** (and related flows). The bridge owns session logic, **optional LLM-based arbitration** to pick the best claimant among workers, and mapping mesh events into HTTP/SSE for the UI.
+- **Frontend:** Next.js app in **`agenc-frontend/`** — bounty composer, templates, mesh visualization, SSE-driven cards, optional wallet + escrow against **`NEXT_PUBLIC_CONTRACT_ADDRESS`**.
+- **Backend:** FastAPI app in **`agenc-api/`** — translates UI actions into AXL **`/send`**, **`/recv`**, **`/topology`**; owns claim windows, **LLM arbiter**, collaboration orchestration (**`COLLAB_AWARD`**, **`COLLAB_SHARE`**), bounty persistence (**`BountyFSM`**), **SSE** fan-out (`/api/events`), optional **worker telemetry** POST, and optional **Base Sepolia** escrow settle/refund + reputation reads.
 
 Together this follows the **[GStack](https://github.com/garrytan/gstack)** pattern: Next.js + Python API wired for fast iteration.
 
 ### 3. Agent intelligence
 
-- **Default model:** OpenAI **`gpt-4o-mini`** for low-latency task execution on workers (configurable per deployment).
-- **Tools:** Workers may expose **OpenAI-style tools** for market data (CoinGecko + Uniswap subgraph), **Gemini image generation**, and shared **MCP** services (`web-search`, `shared-memory`) reached via the local node **`POST /mcp/{peer_id}/{service}`** when `MCP_SERVICE_PEER_ID` is configured.
-- **Extensibility:** Worker behavior is modular (e.g. auditor, researcher, coder personas) as separate processes or router paths, still speaking the same bounty protocol over AXL.
+- **Default models:** Workers commonly use OpenAI **`gpt-4o-mini`** or **Gemini** (per `LLM_PROVIDER`); the bridge arbiter supports **OpenAI**, **Gemini**, or **OpenRouter** (`BRIDGE_LLM_PROVIDER`).
+- **Four worker personas** (example deployment): **Data Analyst**, **Creative Strategist**, **Sentiment Analyst**, **Yield Scout** — each with a tool manifest (market/Uniswap, Gemini images, sentiment/yield APIs, MCP-backed web search and shared memory).
+- **Tools:** OpenAI-style tools in **`worker_tools/`**; **MCP** services **`web-search`** and **`shared-memory`** via **`MCP_ROUTER_HTTP`** → router **`POST /route`**, or via the node **`POST /mcp/{peer_id}/{service}`** when **`MCP_SERVICE_PEER_ID`** is set. Optional **Perplexity** for grounded search when **`PERPLEXITY_API_KEY`** is set.
+- **Collaboration:** **`collab_protocol.py`** defines roles (**data**, **creative**, **sentiment**, **yield**) — shared-memory keys, who produces artifacts, and staggered execution for creative workers.
+- **Extensibility:** Additional personas or tools remain in separate processes speaking the same bounty protocol over AXL.
 
 ---
 
@@ -106,7 +108,7 @@ The bridge sends exactly one **`AWARD`** to the chosen worker and **`REJECTED`**
 }
 ```
 
-Implementations MAY add fields (e.g. correlation ids, emitter public key echoes) provided all parties agree. Wire limits follow AXL’s max message size (see **`node-config.json`** / [`docs/configuration.md`](configuration.md)).
+Implementations MAY add fields (e.g. correlation ids, collaboration payloads **`COLLAB_SHARE`**, embedded **images** on `COMPLETED_BOUNTY`). Wire limits follow AXL’s max message size (see **`node-config.json`** / [`docs/configuration.md`](configuration.md)).
 
 ---
 
@@ -128,7 +130,7 @@ Implementations MAY add fields (e.g. correlation ids, emitter public key echoes)
 | **Phase 1** — P2P mesh (e.g. 3 local AXL nodes) | Complete |
 | **Phase 2** — OpenAI on workers; real results over the mesh | Complete |
 | **Phase 3** — GStack UI; post bounties from web dashboard | Complete |
-| **Phase 4** — Competitive claims + bridge arbiter + visual node status | In progress |
+| **Phase 4** — Competitive claims + bridge arbiter + visual node status + collaboration | Largely implemented (polish / demo hardening ongoing) |
 
 ---
 
@@ -137,9 +139,14 @@ Implementations MAY add fields (e.g. correlation ids, emitter public key echoes)
 | Path | Role |
 |------|------|
 | **`cmd/node/`**, **`api/`**, **`internal/`** | AXL-compatible Go **`node`** — HTTP bridge to mesh |
+| **`agenc-api/`** | FastAPI bridge — bounties, arbiter, SSE, escrow/reputation hooks |
 | **`agenc-frontend/`** | Next.js AgenC dashboard |
-| **`integrations/`** | Optional Python MCP / A2A sidecars for AXL |
+| **`worker*.py`**, **`worker_core.py`**, **`worker_tools/`** | Mesh workers and tool registry |
+| **`collab_protocol.py`** | Collaboration role definitions |
+| **`integrations/`** | MCP router, MCP sidecars (**web-search**, **shared-memory**), optional A2A server |
+| **`deploy/`** | systemd units, **`env.template`**, optional nginx sample |
 | **`docs/agenc.md`** | This document (product + protocol) |
+| **`docs/deployment.md`** | VPS/systemd/MCP deployment |
 | **`docs/architecture.md`**, **`docs/api.md`** | AXL internals and endpoints |
 
 For day-to-day implementation details for coding agents, see **[`AGENTS.md`](../AGENTS.md)** at the repository root.
