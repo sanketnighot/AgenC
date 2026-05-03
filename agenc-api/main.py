@@ -130,6 +130,21 @@ node_states: dict = {
     },
 }
 
+# Optional: override AXL public keys (64-char hex) when deploy keys differ from repo defaults.
+# Must match each worker's `GET http://127.0.0.1:<api_port>/topology` → our_public_key.
+_peer_env = {
+    "worker_1": "WORKER1_PEER_ID",
+    "worker_2": "WORKER2_PEER_ID",
+    "worker_3": "WORKER3_PEER_ID",
+    "worker_4": "WORKER4_PEER_ID",
+}
+for _nk, _ev in _peer_env.items():
+    _v = os.environ.get(_ev, "").strip()
+    if not _v or _nk not in WORKER_NODES:
+        continue
+    _v = _v.lower().removeprefix("0x")
+    WORKER_NODES[_nk]["peer_id"] = _v
+
 for _w in WORKER_NODES.values():
     _w["peer_id"] = _w["peer_id"].strip().lower()
 

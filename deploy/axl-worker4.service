@@ -1,0 +1,16 @@
+[Unit]
+Description=AXL Worker 4 Node (HTTP API for Yield Scout)
+After=network.target axl-emitter.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/AgenC
+ExecStart=/root/AgenC/node -config /root/AgenC/worker4-config.json
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

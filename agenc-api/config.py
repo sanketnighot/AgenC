@@ -63,4 +63,6 @@ BOUNTIES_FILE = os.environ.get(
 WORKER_ETH_ADDRESSES: dict[str, str] = {
     "worker_1": os.environ.get("WORKER1_ETH_ADDRESS", "").strip().lower(),
     "worker_2": os.environ.get("WORKER2_ETH_ADDRESS", "").strip().lower(),
+    "worker_3": os.environ.get("WORKER3_ETH_ADDRESS", "").strip().lower(),
+    "worker_4": os.environ.get("WORKER4_ETH_ADDRESS", "").strip().lower(),
 }
